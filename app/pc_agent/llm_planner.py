@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from app.agent.llm_client import LLMClient
 
@@ -33,6 +33,7 @@ async def plan_pc_actions(
     session_context: dict[str, Any] | None = None,
     previous_plan: list[dict[str, Any]] | None = None,
     revision_request: str | None = None,
+    stream_handler: Callable[[str], Awaitable[str]] | None = None,
 ) -> list[dict[str, Any]] | None:
     if llm_client is None:
         return None
@@ -43,7 +44,10 @@ async def plan_pc_actions(
         revision_request=revision_request,
     )
     try:
-        response_text = await asyncio.to_thread(llm_client.generate_text, prompt)
+        if stream_handler:
+            response_text = await stream_handler(prompt)
+        else:
+            response_text = await asyncio.to_thread(llm_client.generate_text, prompt)
     except Exception as exc:  # pragma: no cover - network/proxy errors
         logger.error("LLM planning failed: %s", exc)
         return None

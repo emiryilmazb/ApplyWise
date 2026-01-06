@@ -6,7 +6,7 @@ import re
 import time
 import zipfile
 import xml.etree.ElementTree as ET
-from typing import Optional
+from typing import AsyncIterator, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,21 @@ class LLMClient:
     def generate_with_file(self, prompt: str, file_path: str, mime_type: str | None = None) -> "FileGenerationResult":
         raise NotImplementedError
 
+    def generate_suggestions(self, history_text: str) -> list[str]:
+        raise NotImplementedError
+
+    async def stream_text(self, prompt: str, include_thoughts: bool = False) -> "AsyncIterator[StreamChunk]":
+        raise NotImplementedError
+
+    async def stream_with_image(
+        self,
+        prompt: str,
+        image_path: str,
+        mime_type: str | None = None,
+        include_thoughts: bool = False,
+    ) -> "AsyncIterator[StreamChunk]":
+        raise NotImplementedError
+
 
 @dataclass(frozen=True)
 class GeminiConfig:
@@ -35,6 +50,18 @@ class FileGenerationResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class StreamChunk:
+    text: str
+    is_thought: bool = False
+
+
+@dataclass(frozen=True)
+class ImageStreamState:
+    chunks: AsyncIterator[StreamChunk]
+    get_image_bytes: Callable[[], bytes | None]
+
+
 class GeminiClient(LLMClient):
     def __init__(self, config: GeminiConfig) -> None:
         try:
@@ -46,16 +73,84 @@ class GeminiClient(LLMClient):
         self._model = config.model
 
     def generate_text(self, prompt: str) -> str:
-        response = self._client.models.generate_content(model=self._model, contents=prompt)
+        response = self._client.models.generate_content(
+            model=self._model, contents=prompt)
         if getattr(response, "text", None):
             return response.text
         return ""
+
+    async def stream_text(self, prompt: str, include_thoughts: bool = False) -> AsyncIterator[StreamChunk]:
+        if not prompt:
+            return
+        from google.genai import types
+
+        config = None
+        if include_thoughts:
+            config = types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(include_thoughts=True),
+            )
+        stream = await self._client.aio.models.generate_content_stream(
+            model=self._model,
+            contents=prompt,
+            config=config,
+        )
+        async for chunk in stream:
+            parts = getattr(chunk, "parts", None) or []
+            if parts:
+                for part in parts:
+                    text = getattr(part, "text", None)
+                    if isinstance(text, str) and text:
+                        yield StreamChunk(text=text, is_thought=bool(getattr(part, "thought", False)))
+                continue
+            text = getattr(chunk, "text", None)
+            if isinstance(text, str) and text:
+                yield StreamChunk(text=text, is_thought=False)
+
+    async def stream_with_image(
+        self,
+        prompt: str,
+        image_path: str,
+        mime_type: str | None = None,
+        include_thoughts: bool = False,
+    ) -> AsyncIterator[StreamChunk]:
+        if not prompt or not image_path:
+            return
+        from google.genai import types
+
+        with open(image_path, "rb") as handle:
+            image_data = handle.read()
+        resolved_mime = mime_type or mimetypes.guess_type(image_path)[0] or "image/png"
+        config = None
+        if include_thoughts:
+            config = types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(include_thoughts=True),
+            )
+        stream = await self._client.aio.models.generate_content_stream(
+            model=self._model,
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=image_data, mime_type=resolved_mime),
+            ],
+            config=config,
+        )
+        async for chunk in stream:
+            parts = getattr(chunk, "parts", None) or []
+            if parts:
+                for part in parts:
+                    text = getattr(part, "text", None)
+                    if isinstance(text, str) and text:
+                        yield StreamChunk(text=text, is_thought=bool(getattr(part, "thought", False)))
+                continue
+            text = getattr(chunk, "text", None)
+            if isinstance(text, str) and text:
+                yield StreamChunk(text=text, is_thought=False)
 
     def generate_with_file(self, prompt: str, file_path: str, mime_type: str | None = None) -> FileGenerationResult:
         if not prompt or not file_path:
             return FileGenerationResult("", "Missing prompt or file.")
         if getattr(self._client, "vertexai", False):
-            logger.warning("File upload is not supported for Vertex AI client.")
+            logger.warning(
+                "File upload is not supported for Vertex AI client.")
             return FileGenerationResult("", "File upload is not supported for this client.")
         from google.genai import types
 
@@ -64,13 +159,16 @@ class GeminiClient(LLMClient):
             text_payload = _extract_text_fallback(file_path, normalized_mime)
             if not text_payload:
                 return FileGenerationResult("", _unreadable_file_message(file_path, normalized_mime))
-            response_text = self.generate_text(_merge_prompt_and_text(prompt, text_payload))
+            response_text = self.generate_text(
+                _merge_prompt_and_text(prompt, text_payload))
             if response_text:
                 return FileGenerationResult(response_text)
             return FileGenerationResult("", "No response generated for the document.")
         try:
-            upload_config = types.UploadFileConfig(mime_type=normalized_mime) if normalized_mime else None
-            file_obj = self._client.files.upload(file=file_path, config=upload_config)
+            upload_config = types.UploadFileConfig(
+                mime_type=normalized_mime) if normalized_mime else None
+            file_obj = self._client.files.upload(
+                file=file_path, config=upload_config)
             file_obj = _wait_for_file_active(self._client, file_obj)
             if not file_obj or not getattr(file_obj, "uri", None):
                 return FileGenerationResult("", "File upload failed.")
@@ -90,15 +188,43 @@ class GeminiClient(LLMClient):
             return FileGenerationResult("", "No response generated for the document.")
         except Exception as exc:  # pragma: no cover - network/proxy errors
             if _is_unsupported_mime_error(exc):
-                text_payload = _extract_text_fallback(file_path, normalized_mime)
+                text_payload = _extract_text_fallback(
+                    file_path, normalized_mime)
                 if text_payload:
-                    response_text = self.generate_text(_merge_prompt_and_text(prompt, text_payload))
+                    response_text = self.generate_text(
+                        _merge_prompt_and_text(prompt, text_payload))
                     if response_text:
                         return FileGenerationResult(response_text)
                     return FileGenerationResult("", "No response generated for the document.")
                 return FileGenerationResult("", _unreadable_file_message(file_path, normalized_mime))
             logger.warning("File upload failed: %s", exc)
             return FileGenerationResult("", "Sorry, I couldn't process this document right now.")
+
+    def generate_suggestions(self, history_text: str) -> list[str]:
+        prompt = (
+            "You are generating Telegram inline suggestion buttons for a multimodal assistant.\n"
+            "Use the recent conversation history and session context to propose the next best steps.\n"
+            "Suggestions should be specific, interesting, and directly actionable by the assistant\n"
+            "(chat, computer-use, image edit, or image generation).\n"
+            "If the task is computer-use, suggest the next step inside the active app.\n"
+            "If the task is image-related, suggest visual edits or creative variations.\n"
+            "Keep the user's language.\n"
+            "Aim for variety: action steps, creative twists, and practical follow-ups.\n"
+            "Avoid generic or unrelated suggestions.\n\n"
+            f"Context:\n{history_text}\n\n"
+            "Return exactly 8 suggestions as a pipe-separated list. "
+            "Each suggestion should be 2-7 words, start with a relevant emoji, "
+            "and avoid quotes or numbering."
+        )
+        try:
+            response = self.generate_text(prompt)
+            if not response:
+                return []
+            suggestions = [s.strip() for s in response.split("|") if s.strip()]
+            return suggestions[:8]
+        except Exception as exc:
+            logger.warning("Suggestion generation failed: %s", exc)
+            return []
 
 
 def _extract_image_bytes(response) -> bytes | None:
@@ -132,6 +258,7 @@ def _merge_prompt_and_text(prompt: str, text_payload: str, max_chars: int = 1200
         text_payload = text_payload[:max_chars]
         return f"{prompt}\n\nDocument (truncated):\n{text_payload}"
     return f"{prompt}\n\nDocument:\n{text_payload}"
+
 
 def _is_unsupported_mime_error(exc: Exception) -> bool:
     message = str(exc).lower()
@@ -279,6 +406,7 @@ def _extract_rtf_text(path: str) -> str | None:
     except Exception as exc:
         logger.warning("RTF read failed: %s", exc)
         return None
+
     def _rtf_hex(match: re.Match[str]) -> str:
         try:
             return bytes.fromhex(match.group(1)).decode("latin-1")
@@ -286,7 +414,7 @@ def _extract_rtf_text(path: str) -> str | None:
             return ""
     text = re.sub(r"\\'([0-9a-fA-F]{2})", _rtf_hex, raw)
     text = re.sub(r"\\par[d]?\s?", "\n", text)
-    text = re.sub(r"\\[a-zA-Z]+-?\d* ?","", text)
+    text = re.sub(r"\\[a-zA-Z]+-?\d* ?", "", text)
     text = text.replace("{", "").replace("}", "")
     cleaned = re.sub(r"\n{3,}", "\n\n", text).strip()
     return cleaned or None
@@ -376,7 +504,8 @@ class GeminiImageClient:
         if not getattr(self._client, "vertexai", False):
             return self._generate_image_via_content(prompt)
         try:
-            response = self._client.models.generate_images(model=self._model, prompt=prompt)
+            response = self._client.models.generate_images(
+                model=self._model, prompt=prompt)
             image_bytes = _extract_image_bytes(response)
             if image_bytes:
                 return image_bytes
@@ -427,6 +556,57 @@ class GeminiImageClient:
             return response.text
         return ""
 
+    async def stream_generate_image(self, prompt: str, include_thoughts: bool = False) -> ImageStreamState:
+        if not prompt:
+            return ImageStreamState(chunks=_empty_stream(), get_image_bytes=lambda: None)
+        from google.genai import types
+
+        modalities = [types.Modality.IMAGE]
+        if include_thoughts:
+            modalities.append(types.Modality.TEXT)
+        config = types.GenerateContentConfig(
+            response_modalities=modalities,
+        )
+        if include_thoughts:
+            config.thinking_config = types.ThinkingConfig(include_thoughts=True)
+        stream = await self._client.aio.models.generate_content_stream(
+            model=self._model,
+            contents=prompt,
+            config=config,
+        )
+        return _build_image_stream_state(stream)
+
+    async def stream_edit_image(
+        self,
+        prompt: str,
+        image_path: str,
+        include_thoughts: bool = False,
+    ) -> ImageStreamState:
+        if not prompt or not image_path:
+            return ImageStreamState(chunks=_empty_stream(), get_image_bytes=lambda: None)
+        from google.genai import types
+
+        with open(image_path, "rb") as handle:
+            image_data = handle.read()
+        mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+        modalities = [types.Modality.IMAGE]
+        if include_thoughts:
+            modalities.append(types.Modality.TEXT)
+        config = types.GenerateContentConfig(
+            response_modalities=modalities,
+        )
+        if include_thoughts:
+            config.thinking_config = types.ThinkingConfig(include_thoughts=True)
+        stream = await self._client.aio.models.generate_content_stream(
+            model=self._model,
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=image_data, mime_type=mime_type),
+            ],
+            config=config,
+        )
+        return _build_image_stream_state(stream)
+
     def _generate_image_via_content(self, prompt: str) -> bytes | None:
         from google.genai import types
 
@@ -466,6 +646,48 @@ class NoOpLLMClient(LLMClient):
     def generate_with_file(self, prompt: str, file_path: str, mime_type: str | None = None) -> FileGenerationResult:
         logger.warning("LLM disabled; returning empty response.")
         return FileGenerationResult("", "LLM is not configured.")
+
+    async def stream_text(self, prompt: str, include_thoughts: bool = False) -> AsyncIterator[StreamChunk]:
+        if False:  # pragma: no cover - keeps this as an async generator
+            yield StreamChunk(text="", is_thought=False)
+
+    async def stream_with_image(
+        self,
+        prompt: str,
+        image_path: str,
+        mime_type: str | None = None,
+        include_thoughts: bool = False,
+    ) -> AsyncIterator[StreamChunk]:
+        if False:  # pragma: no cover - keeps this as an async generator
+            yield StreamChunk(text="", is_thought=False)
+
+
+async def _empty_stream() -> AsyncIterator[StreamChunk]:
+    if False:  # pragma: no cover - keeps this as an async generator
+        yield StreamChunk(text="", is_thought=False)
+
+
+def _build_image_stream_state(stream) -> ImageStreamState:
+    image_bytes: bytes | None = None
+
+    async def _iter() -> AsyncIterator[StreamChunk]:
+        nonlocal image_bytes
+        async for chunk in stream:
+            new_bytes = _extract_image_bytes(chunk)
+            if new_bytes:
+                image_bytes = new_bytes
+            parts = getattr(chunk, "parts", None) or []
+            if parts:
+                for part in parts:
+                    text = getattr(part, "text", None)
+                    if isinstance(text, str) and text:
+                        yield StreamChunk(text=text, is_thought=bool(getattr(part, "thought", False)))
+                continue
+            text = getattr(chunk, "text", None)
+            if isinstance(text, str) and text:
+                yield StreamChunk(text=text, is_thought=False)
+
+    return ImageStreamState(chunks=_iter(), get_image_bytes=lambda: image_bytes)
 
 
 def build_llm_client(api_key: str, model: str) -> Optional[LLMClient]:

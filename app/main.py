@@ -145,6 +145,7 @@ async def main() -> None:
     application.bot_data["image_client"] = image_client
     application.bot_data["model_factory"] = model_factory
     application.bot_data["db"] = db
+    application.bot_data["settings"] = settings
 
     logger.info("Agent starting")
     context.start()

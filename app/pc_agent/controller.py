@@ -5,11 +5,14 @@ import logging
 from uuid import uuid4
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 
 from app.agent.state import AgentContext
+from app.config import get_settings
 from app.pc_agent.executor import execute_action, ExecutionError
 from app.pc_agent.planner import build_action_plan, requires_extra_confirmation
 from app.session_manager import get_session_context, record_task_completion
+from app.telegram.streaming import AsyncStreamHandler, MessageManager
 
 logger = logging.getLogger(__name__)
 
@@ -89,12 +92,46 @@ async def run_task_with_approval(
         from app.pc_agent.llm_planner import plan_pc_actions
 
         session_context = get_session_context(session_user_id)
+        settings = get_settings()
+        streaming_enabled = bool(getattr(settings, "streaming_enabled", False))
+        show_thoughts = bool(getattr(settings, "show_thoughts", True))
+        stream_handler = None
+        if streaming_enabled and hasattr(llm_client, "stream_text") and telegram_app and chat_id:
+            live_message = await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text="⏳ Revising plan...",
+                parse_mode=ParseMode.HTML,
+            )
+            manager = MessageManager(
+                bot=telegram_app.bot,
+                chat_id=str(chat_id),
+                message_id=live_message.message_id,
+            )
+            handler = AsyncStreamHandler(
+                manager,
+                show_thoughts=show_thoughts,
+                response_label="Plan",
+                response_as_code=True,
+            )
+
+            async def _stream_prompt(prompt: str) -> str:
+                result = await handler.stream(
+                    llm_client,
+                    prompt,
+                    include_thoughts=show_thoughts,
+                )
+                await manager.finalize(handler.format_message())
+                return result.response_text
+
+            stream_handler = _stream_prompt
+
         revised_steps = await plan_pc_actions(
             llm_client,
             task,
             session_context=session_context,
             previous_plan=current_steps,
             revision_request=revision,
+            stream_handler=stream_handler,
         )
         if not revised_steps:
             if telegram_app and chat_id:
