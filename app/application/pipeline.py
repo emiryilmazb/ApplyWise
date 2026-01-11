@@ -11,6 +11,7 @@ from playwright.async_api import async_playwright
 from app.agent.form_intelligence import process_question
 from app.agent.state import AgentContext
 from app.agent.types import Intent
+from app.config import get_settings
 from app.application.session import (
     FailureReason,
     JobApplicationSession,
@@ -28,6 +29,22 @@ logger = logging.getLogger(__name__)
 class PipelineResult:
     session: JobApplicationSession
     status: SessionStatus
+
+
+def _resolve_runtime_settings(telegram_app):
+    if telegram_app is None:
+        return get_settings()
+    bot_data = getattr(telegram_app, "bot_data", None)
+    if not bot_data:
+        return get_settings()
+    return bot_data.get("settings") or get_settings()
+
+
+def _is_computer_use_enabled(telegram_app, pc_agent_enabled: bool) -> bool:
+    if not pc_agent_enabled:
+        return False
+    settings = _resolve_runtime_settings(telegram_app)
+    return bool(getattr(settings, "computer_use_enabled", True))
 
 
 def _should_persist_answer(intent: Intent, submitted: bool) -> bool:
@@ -52,6 +69,18 @@ async def run_session(
 ) -> PipelineResult:
     memory = memory or load_memory_context()
     session.log_event(f"Session started on site={adapter.site_name}")
+
+    settings = _resolve_runtime_settings(telegram_app)
+    if not bool(getattr(settings, "browser_use_enabled", True)):
+        session.pause()
+        session.log_event("Paused: browser use disabled")
+        if telegram_app and chat_id:
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text="Browser automation is disabled. Send 'browser on' to enable.",
+            )
+        return PipelineResult(session=session, status=session.status)
+    pc_agent_enabled = pc_agent_enabled and bool(getattr(settings, "computer_use_enabled", True))
 
     page = await _ensure_playwright_page(agent_context)
     if not session.steps:
@@ -89,7 +118,7 @@ async def run_session(
                 chat_id,
             )
             if not result.success:
-                if pc_agent_enabled and result.failure_reason == FailureReason.UNEXPECTED_STRUCTURE:
+                if _is_computer_use_enabled(telegram_app, pc_agent_enabled) and result.failure_reason == FailureReason.UNEXPECTED_STRUCTURE:
                     recovery = await _attempt_pc_recovery(
                         session,
                         agent_context,
@@ -181,7 +210,7 @@ async def run_session(
             chat_id,
         )
         if not result.success:
-            if pc_agent_enabled and result.failure_reason == FailureReason.UNEXPECTED_STRUCTURE:
+            if _is_computer_use_enabled(telegram_app, pc_agent_enabled) and result.failure_reason == FailureReason.UNEXPECTED_STRUCTURE:
                 recovery = await _attempt_pc_recovery(
                     session,
                     agent_context,

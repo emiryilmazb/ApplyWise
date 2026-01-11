@@ -122,12 +122,46 @@ _GMAIL_TOKENS = (
     "gelen kutu",
     "gelen kutusu",
     "gelen kutum",
+    "mail kutusu",
+    "mail kutum",
+    "mailler",
+    "maillerim",
 )
-_GMAIL_SUMMARY_TOKENS = ("summarize", "summary", "brief summary", "ozet", "kisa ozet")
-_GMAIL_SEARCH_TOKENS = ("ara", "search", "bul", "find")
-_GMAIL_DRAFT_TOKENS = ("taslak", "draft", "yaz", "olustur", "hazirla")
-_GMAIL_SEND_TOKENS = ("send", "deliver", "email", "mail", "gonder", "yolla", "mail at")
-_GMAIL_QUESTION_TOKENS = ("otp", "code", "how many", "count", "number of", "onay kodu", "kac tane", "sayi")
+_GMAIL_SUMMARY_TOKENS = (
+    "summarize",
+    "summary",
+    "brief summary",
+    "ozet",
+    "kisa ozet",
+    "ozetle",
+    "ozet cikar",
+    "mail ozet",
+)
+_GMAIL_SEARCH_TOKENS = ("ara", "search", "bul", "find", "tara", "listele")
+_GMAIL_DRAFT_TOKENS = ("taslak", "draft", "yaz", "olustur", "hazirla", "mail yaz", "eposta yaz")
+_GMAIL_SEND_TOKENS = (
+    "send",
+    "deliver",
+    "email",
+    "mail",
+    "gonder",
+    "yolla",
+    "mail at",
+    "eposta gonder",
+    "mail gonder",
+)
+_GMAIL_QUESTION_TOKENS = (
+    "otp",
+    "code",
+    "how many",
+    "count",
+    "number of",
+    "onay kodu",
+    "dogrulama kodu",
+    "kac tane",
+    "sayi",
+    "ne kadar",
+)
 
 
 def route_intent(

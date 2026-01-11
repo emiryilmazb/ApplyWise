@@ -16,7 +16,7 @@ _SESSIONS: dict[str, "SessionState"] = {}
 
 _SHORT_TERM_LIMIT = 5
 _RECENT_IMAGE_LIMIT = 10
-_RESET_TOKENS = ("reset", "cancel", "stop", "iptal")
+_RESET_TOKENS = ("reset", "cancel", "stop", "iptal", "vazgec")
 
 _APP_ALIASES: dict[str, tuple[str, ...]] = {
     "whatsapp": ("whatsapp", "whats app"),

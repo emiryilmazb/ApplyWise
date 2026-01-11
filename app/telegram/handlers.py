@@ -188,6 +188,8 @@ _CLEAR_HISTORY_COMMANDS = {
     "/clear_history",
     "gecmis temizle",
     "sohbet gecmisi temizle",
+    "sohbeti temizle",
+    "gecmisi sil",
 }
 _CLEAR_HISTORY_CONFIRM_TOKENS = {"yes", "y", "confirm", "evet", "onay", "onayla"}
 _CLEAR_HISTORY_CANCEL_TOKENS = {"no", "n", "cancel", "hayir", "iptal", "vazgec"}
@@ -196,8 +198,12 @@ _THINKING_ON_COMMAND = "thinking_on"
 _THINKING_OFF_COMMAND = "thinking_off"
 _SCREENSHOT_ON_COMMAND = "screenshot on"
 _SCREENSHOT_OFF_COMMAND = "screenshot off"
+_BROWSER_USE_ON_COMMANDS = {"browser on", "browser use on"}
+_BROWSER_USE_OFF_COMMANDS = {"browser off", "browser use off"}
+_COMPUTER_USE_ON_COMMANDS = {"pc on", "computer on", "computer use on"}
+_COMPUTER_USE_OFF_COMMANDS = {"pc off", "computer off", "computer use off"}
 _ANON_ON_COMMANDS = {"anonymous on", "anonim on"}
-_ANON_OFF_COMMANDS = {"anonymous off", "anonim off"}
+_ANON_OFF_COMMANDS = {"anonymous off", "anonim off", "anonim kapat"}
 _COMMAND_LIST_COMMANDS = {"commands", "/commands", "/help", "help", "komutlar", "/komutlar"}
 _CLEAR_HISTORY_CONFIRM_DATA = "clear_history_yes"
 _CLEAR_HISTORY_CANCEL_DATA = "clear_history_no"
@@ -506,17 +512,46 @@ def _extract_limit_from_text(text: str, default: int = 5, max_value: int = 25) -
         return default
 
 
+def _resolve_gmail_time_hint(text: str) -> str | None:
+    normalized = _normalize_text(text or "")
+    if "today" in normalized or "bugun" in normalized or "bu gun" in normalized:
+        return "newer_than:1d"
+    if "dun" in normalized or "yesterday" in normalized:
+        return "newer_than:2d"
+    if "bu hafta" in normalized or "this week" in normalized:
+        return "newer_than:7d"
+    if "son hafta" in normalized or "last week" in normalized:
+        return "newer_than:14d"
+    if "bu ay" in normalized or "this month" in normalized:
+        return "newer_than:30d"
+    if "son ay" in normalized or "last month" in normalized:
+        return "newer_than:60d"
+    return None
+
+
 def _should_send_email(text: str) -> bool:
     normalized = _normalize_text(text or "")
     return any(
         token in normalized
-        for token in ("send", "email", "mail", "deliver", "gonder", "yolla", "eposta at")
+        for token in (
+            "send",
+            "email",
+            "mail",
+            "deliver",
+            "gonder",
+            "yolla",
+            "eposta at",
+            "mail at",
+            "gonderir misin",
+            "gonder",
+            "gondersene",
+        )
     )
 
 
 def _should_summarize_email(text: str) -> bool:
     normalized = _normalize_text(text or "")
-    return any(token in normalized for token in ("summary", "summarize", "ozet"))
+    return any(token in normalized for token in ("summary", "summarize", "ozet", "ozetle", "kisa ozet"))
 
 
 def _store_gmail_pending_send(context: ContextTypes.DEFAULT_TYPE, question_id: str, payload: dict) -> None:
@@ -544,6 +579,22 @@ def _parse_json_block(text: str) -> dict | None:
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
+
+
+def _parse_subject_body(text: str) -> tuple[str, str]:
+    data = _parse_json_block(text) or {}
+    subject = str(data.get("subject") or "").strip()
+    body = str(data.get("body") or "").strip()
+    return subject, body
+
+
+def _contains_word_token(text: str, tokens: set[str]) -> bool:
+    for token in tokens:
+        if not token:
+            continue
+        if re.search(rf"\b{re.escape(token)}\b", text):
+            return True
+    return False
 
 
 def _extract_draft_request(llm_client, message_text: str) -> dict:
@@ -654,6 +705,17 @@ def _apply_signature(spec: DraftSpec, signature_name: str | None) -> DraftSpec:
     return DraftSpec(to=spec.to, subject=spec.subject, body=updated_body)
 
 
+def _build_revision_prompt(subject: str, body: str, instruction: str) -> str:
+    return (
+        "You are revising an email draft.\n"
+        "Return ONLY JSON with keys: subject, body.\n"
+        "Keep the recipient context the same. Apply the user's instruction.\n\n"
+        f"Current subject: {subject}\n"
+        f"Current body:\n{body}\n\n"
+        f"Instruction: {instruction}\n"
+    )
+
+
 def _parse_gmail_action_plan(intent: RouterIntent, payload: dict) -> dict:
     operation = str(payload.get("operation") or "").strip().lower()
     if not operation:
@@ -740,8 +802,8 @@ async def _handle_gmail_intelligent_request(
         subject = str(draft_data.get("subject") or "").strip()
         prompt_text = str(draft_data.get("prompt") or "").strip() or message_text
         if not recipient:
-        await message.reply_text("Who should I send it to? Please provide an email address.")
-        return True
+            await message.reply_text("Who should I send it to? Please provide an email address.")
+            return True
         try:
             spec = await asyncio.to_thread(
                 gmail_service.build_draft_from_prompt, llm_client, recipient, prompt_text
@@ -774,7 +836,7 @@ async def _handle_gmail_intelligent_request(
                     "draft_id": draft_id,
                     "to": spec.to,
                     "subject": spec.subject,
-                    "preview": spec.body[:500],
+                    "body": spec.body,
                 },
             )
             preview_text = _build_draft_preview_text(spec)
@@ -787,10 +849,7 @@ async def _handle_gmail_intelligent_request(
         return True
 
     if operation in {"inbox", "summary"}:
-        query_hint = None
-        normalized = _normalize_text(message_text)
-        if "today" in normalized:
-            query_hint = "newer_than:1d"
+        query_hint = _resolve_gmail_time_hint(message_text)
         if operation == "inbox":
             await _handle_gmail_inbox(
                 context,
@@ -1014,6 +1073,40 @@ def _set_screenshot_enabled(context: ContextTypes.DEFAULT_TYPE, enabled: bool) -
     return True
 
 
+def _resolve_browser_use_command(normalized: str) -> bool | None:
+    if normalized in _BROWSER_USE_ON_COMMANDS:
+        return True
+    if normalized in _BROWSER_USE_OFF_COMMANDS:
+        return False
+    return None
+
+
+def _resolve_computer_use_command(normalized: str) -> bool | None:
+    if normalized in _COMPUTER_USE_ON_COMMANDS:
+        return True
+    if normalized in _COMPUTER_USE_OFF_COMMANDS:
+        return False
+    return None
+
+
+def _set_browser_use_enabled(context: ContextTypes.DEFAULT_TYPE, enabled: bool) -> bool:
+    settings = _resolve_settings(context)
+    if bool(getattr(settings, "browser_use_enabled", True)) == enabled:
+        return False
+    context.application.bot_data["settings"] = replace(
+        settings, browser_use_enabled=enabled)
+    return True
+
+
+def _set_computer_use_enabled(context: ContextTypes.DEFAULT_TYPE, enabled: bool) -> bool:
+    settings = _resolve_settings(context)
+    if bool(getattr(settings, "computer_use_enabled", True)) == enabled:
+        return False
+    context.application.bot_data["settings"] = replace(
+        settings, computer_use_enabled=enabled)
+    return True
+
+
 def _is_command_list_command(normalized: str) -> bool:
     return normalized in _COMMAND_LIST_COMMANDS
 
@@ -1025,6 +1118,8 @@ def _build_command_list_text() -> str:
             "- clear_history or /clear_history: clears chat history.",
             "- thinking_on / thinking_off: toggles thought streaming.",
             "- screenshot on / screenshot off: toggles post-step screenshots.",
+            "- browser on / browser off: toggles browser automation.",
+            "- pc on / pc off: toggles computer control.",
             "- anonymous on / anonymous off: disables/enables chat logging.",
             "- /memory: lists stored memory summaries.",
             "- /forget <id>: deletes the selected memory item.",
@@ -1188,7 +1283,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
     await update.message.reply_text(
-        "Atlas bot is online",
+        "Atlas is online. System integrity confirmed.\n\n"
+        "Gmail layers are synced, and the Gemini core is standing by. I've indexed your latest "
+        "communications and prepared your digital workspace. Your Chief of Staff is ready to orchestrate.\n\n"
+        "How shall we direct our focus today?",
         reply_markup=build_main_keyboard(),
     )
 
@@ -1348,6 +1446,20 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             status = "enabled" if enabled else "disabled"
             suffix = " now" if changed else " already"
             await message.reply_text(f"Screenshots are{suffix} {status}.")
+            return
+        browser_toggle = _resolve_browser_use_command(normalized)
+        if browser_toggle is not None:
+            changed = _set_browser_use_enabled(context, browser_toggle)
+            status = "enabled" if browser_toggle else "disabled"
+            suffix = " now" if changed else " already"
+            await message.reply_text(f"Browser use is{suffix} {status}.")
+            return
+        computer_toggle = _resolve_computer_use_command(normalized)
+        if computer_toggle is not None:
+            changed = _set_computer_use_enabled(context, computer_toggle)
+            status = "enabled" if computer_toggle else "disabled"
+            suffix = " now" if changed else " already"
+            await message.reply_text(f"Computer use is{suffix} {status}.")
             return
         if _is_command_list_command(normalized):
             await message.reply_text(_build_command_list_text())
@@ -1774,9 +1886,7 @@ async def _handle_gmail_inbox(
         return
     llm_client = context.application.bot_data.get("llm_client")
     if query_hint is None:
-        normalized = _normalize_text(message_text)
-        if "today" in normalized:
-            query_hint = "newer_than:1d"
+        query_hint = _resolve_gmail_time_hint(message_text)
     try:
         messages = await asyncio.to_thread(gmail_service.list_unread, limit, query_hint)
     except Exception as exc:
@@ -1974,7 +2084,7 @@ async def _handle_gmail_draft(
                 "draft_id": draft_id,
                 "to": spec.to,
                 "subject": spec.subject,
-                "preview": spec.body[:500],
+                "body": spec.body,
             },
         )
         preview_text = _build_draft_preview_text(spec)
@@ -2000,8 +2110,8 @@ async def _handle_gmail_send_approval(
         normalized = reply_text
     else:
         normalized = _normalize_text(reply_text)
-    if normalized == _GMAIL_SEND_CONFIRM_DATA or any(
-        token in normalized for token in _GMAIL_APPROVE_TOKENS
+    if normalized == _GMAIL_SEND_CONFIRM_DATA or _contains_word_token(
+        normalized, _GMAIL_APPROVE_TOKENS
     ):
         pending_payload = _pop_gmail_pending_send(context, pending.question_id)
         if not pending_payload:
@@ -2023,14 +2133,63 @@ async def _handle_gmail_send_approval(
         agent_context.pending_request = None
         await message.reply_text(f"Email sent. Message id: {sent_id}")
         return True
-    if normalized == _GMAIL_SEND_CANCEL_DATA or any(
-        token in normalized for token in _GMAIL_REJECT_TOKENS
+    if normalized == _GMAIL_SEND_CANCEL_DATA or _contains_word_token(
+        normalized, _GMAIL_REJECT_TOKENS
     ):
         _pop_gmail_pending_send(context, pending.question_id)
         agent_context.pending_request = None
         await message.reply_text("Email send canceled.")
         return True
-    await message.reply_text("Please reply with Yes or No.")
+    pending_payload = _pop_gmail_pending_send(context, pending.question_id)
+    if not pending_payload:
+        agent_context.pending_request = None
+        await message.reply_text("Pending Gmail draft not found.")
+        return True
+    llm_client = context.application.bot_data.get("llm_client")
+    if llm_client is None:
+        await message.reply_text("I need the LLM to revise the draft. Please reply Yes or No.")
+        _store_gmail_pending_send(context, pending.question_id, pending_payload)
+        return True
+    draft_subject = str(pending_payload.get("subject") or "").strip()
+    draft_body = str(pending_payload.get("body") or "").strip()
+    instruction = reply_text.strip()
+    prompt = _build_revision_prompt(draft_subject, draft_body, instruction)
+    response = await asyncio.to_thread(llm_client.generate_text, prompt)
+    updated_subject, updated_body = _parse_subject_body(response)
+    if not updated_subject:
+        updated_subject = draft_subject
+    if not updated_body:
+        updated_body = draft_body
+    spec = DraftSpec(
+        to=str(pending_payload.get("to") or ""),
+        subject=updated_subject,
+        body=updated_body,
+    )
+    signature_name = _extract_signature_name(_resolve_user_id_from_message(message))
+    spec = _apply_signature(spec, signature_name)
+    try:
+        gmail_service = _get_gmail_service(context)
+        new_draft_id = await asyncio.to_thread(gmail_service.create_draft, spec)
+    except Exception as exc:
+        logger.warning("Gmail draft revision failed: %s", exc)
+        await message.reply_text("Failed to revise the draft. Please reply Yes or No.")
+        _store_gmail_pending_send(context, pending.question_id, pending_payload)
+        return True
+    _store_gmail_pending_send(
+        context,
+        pending.question_id,
+        {
+            "draft_id": new_draft_id,
+            "to": spec.to,
+            "subject": spec.subject,
+            "body": spec.body,
+        },
+    )
+    preview_text = _build_draft_preview_text(spec)
+    await message.reply_text(
+        f"Revised draft:\n{preview_text}\n\nSend it?",
+        reply_markup=_build_gmail_send_keyboard(),
+    )
     return True
 
 
@@ -3889,21 +4048,21 @@ def _load_chart_font(size: int):
 
 def _resolve_chart_type(text: str) -> str:
     normalized = _normalize_text(text)
-    if _contains_any(normalized, _CANDLE_TOKENS):
+    if _contains_word_token(normalized, set(_CANDLE_TOKENS)):
         return "candlestick"
-    if _contains_any(normalized, _LINE_TOKENS):
+    if _contains_word_token(normalized, set(_LINE_TOKENS)):
         return "line"
     return "bar"
 
 
 def _should_show_moving_average(text: str) -> bool:
     normalized = _normalize_text(text)
-    return _contains_any(normalized, _MA_TOKENS)
+    return _contains_word_token(normalized, set(_MA_TOKENS))
 
 
 def _is_chart_request(text: str) -> bool:
     normalized = _normalize_text(text)
-    return _contains_any(normalized, _CHART_TOKENS)
+    return _contains_word_token(normalized, set(_CHART_TOKENS))
 
 
 def _build_chart_data_prompt(message: str) -> str:
@@ -4881,6 +5040,12 @@ async def _start_pc_task(
             await message.reply_text("Please provide a task after /pc or pc:.")
         return False
 
+    settings = _resolve_settings(context)
+    if not bool(getattr(settings, "computer_use_enabled", True)):
+        if not silent_fail:
+            await message.reply_text("Computer use is disabled. Send 'pc on' to enable.")
+        return False
+
     agent_context = context.application.bot_data.get("agent_context")
     if agent_context is None:
         if not silent_fail:
@@ -4901,7 +5066,6 @@ async def _start_pc_task(
             await message.reply_text("Gemini is not configured. Please set GEMINI_API_KEY.")
         return False
 
-    settings = _resolve_settings(context)
     streaming_enabled = bool(getattr(settings, "streaming_enabled", False))
     show_thoughts = bool(getattr(settings, "show_thoughts", True))
     live_message = None

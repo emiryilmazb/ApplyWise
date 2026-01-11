@@ -40,6 +40,14 @@ async def run_task_with_approval(
     user_id: str | None = None,
     llm_client=None,
 ) -> ControlResult:
+    settings = _resolve_runtime_settings(telegram_app)
+    if not bool(getattr(settings, "computer_use_enabled", True)):
+        if telegram_app and chat_id:
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text="Computer use is disabled. Send 'pc on' to enable.",
+            )
+        return ControlResult(approved=False, completed=False, reason="computer_use_disabled")
     _configure_browser_context(agent_context, telegram_app)
     actions = build_action_plan(task, context)
     current_steps = context.get("steps", []) if context else []
