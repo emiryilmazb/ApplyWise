@@ -52,6 +52,16 @@ class GmailService:
     def ensure_credentials(self) -> None:
         self._auth.get_credentials()
 
+    def delete_token(self) -> bool:
+        return self._auth.delete_token()
+
+    def start_reauth_flow(self):
+        return self._auth.start_reauth_flow()
+
+    def reset(self) -> None:
+        self._service = None
+        self._label_cache = {}
+
     def list_unread(self, max_results: int = 10, query: str | None = None) -> list[GmailMessage]:
         search_query = "is:unread"
         if query:

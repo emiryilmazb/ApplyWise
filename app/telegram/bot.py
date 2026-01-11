@@ -14,7 +14,7 @@ from .handlers import (
     handle_button,
     handle_document_message,
     handle_forget_command,
-    handle_gmail_auth_command,
+    handle_google_auth_command,
     handle_inbox_command,
     handle_memory_command,
     handle_media_message,
@@ -22,6 +22,7 @@ from .handlers import (
     handle_photo_message,
     handle_profile_command,
     handle_profile_forget_command,
+    handle_reauth_command,
     handle_search_mail_command,
     handle_summarize_last_command,
     handle_draft_mail_command,
@@ -58,7 +59,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("forget", handle_forget_command))
     application.add_handler(CommandHandler("profile", handle_profile_command))
     application.add_handler(CommandHandler("profile_forget", handle_profile_forget_command))
-    application.add_handler(CommandHandler("gmail_auth", handle_gmail_auth_command))
+    application.add_handler(CommandHandler("google_auth", handle_google_auth_command))
+    application.add_handler(CommandHandler("google_reauth", handle_reauth_command))
     application.add_handler(CommandHandler("inbox", handle_inbox_command))
     application.add_handler(CommandHandler("summarize_last", handle_summarize_last_command))
     application.add_handler(CommandHandler("search_mail", handle_search_mail_command))

@@ -1125,7 +1125,8 @@ def _build_command_list_text() -> str:
             "- /forget <id>: deletes the selected memory item.",
             "- /profile: shows stored profile facts.",
             "- /profile_forget <id>: deletes the selected profile fact.",
-            "- /gmail_auth: authorizes Gmail access.",
+            "- /google_auth: authorizes Google access.",
+            "- /google_reauth: reauthorizes Google access with updated scopes.",
             "- /inbox [n]: lists unread emails.",
             "- /summarize_last [n]: summarizes unread emails.",
             "- /search_mail <query>: searches Gmail.",
@@ -1285,7 +1286,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Atlas is online. System integrity confirmed.\n\n"
         "Gmail layers are synced, and the Gemini core is standing by. I've indexed your latest "
-        "communications and prepared your digital workspace. Your Chief of Staff is ready to orchestrate.\n\n"
+        "communications and prepared your digital workspace. Your Chief of Staff is ready to orchestrate.\n\n",
         "How shall we direct our focus today?",
         reply_markup=build_main_keyboard(),
     )
@@ -2193,7 +2194,7 @@ async def _handle_gmail_send_approval(
     return True
 
 
-async def handle_gmail_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_google_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if message is None:
         return
@@ -2205,10 +2206,48 @@ async def handle_gmail_auth_command(update: Update, context: ContextTypes.DEFAUL
         gmail_service = _get_gmail_service(context)
         await asyncio.to_thread(gmail_service.ensure_credentials)
     except Exception as exc:
-        logger.warning("Gmail auth failed: %s", exc)
-        await message.reply_text("Gmail authentication failed. Check logs for details.")
+        logger.warning("Google auth failed: %s", exc)
+        await message.reply_text("Google authentication failed. Check logs for details.")
         return
-    await message.reply_text("Gmail authentication completed.")
+    await message.reply_text("Google authentication completed.")
+
+
+async def handle_reauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None:
+        return
+    settings = _resolve_settings(context)
+    if not getattr(settings, "gmail_credentials_path", ""):
+        await message.reply_text("Set GMAIL_OAUTH_CREDENTIALS_PATH to your OAuth JSON first.")
+        return
+    gmail_service = _get_gmail_service(context)
+    try:
+        gmail_service.delete_token()
+        auth_url, complete_flow = gmail_service.start_reauth_flow()
+    except Exception as exc:
+        logger.warning("Google reauth start failed: %s", exc)
+        await message.reply_text("Google reauthentication failed to start. Check logs for details.")
+        return
+
+    await message.reply_text(f"Open this link to authorize:\n{auth_url}")
+
+    async def _runner() -> None:
+        try:
+            await asyncio.to_thread(complete_flow)
+        except Exception as exc:
+            logger.warning("Google reauth failed: %s", exc)
+            await context.application.bot.send_message(
+                chat_id=message.chat_id,
+                text="Google reauthentication failed. Check logs for details.",
+            )
+            return
+        gmail_service.reset()
+        await context.application.bot.send_message(
+            chat_id=message.chat_id,
+            text="Google reauthentication completed.",
+        )
+
+    context.application.create_task(_runner())
 
 
 async def handle_inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

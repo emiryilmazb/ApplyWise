@@ -94,7 +94,7 @@ Start the agent:
 python -m app.main
 ```
 
-Once running, the agent will message you on Telegram: _"The app is running. What should I do?"_
+Once running, the agent will message you on Telegram: _"Atlas is online. System integrity confirmed. Gmail layers are synced, and the Gemini core is standing by. I've indexed your latest communications and prepared your digital workspace. Your Chief of Staff is ready to orchestrate.How shall we direct our focus today?"_
 
 You can command it to start the **"Job Search"** workflow or interact with its other PC agent capabilities directly through the chat interface.
 

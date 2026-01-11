@@ -4,7 +4,10 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
+import webbrowser
+import wsgiref.simple_server
+import wsgiref.util
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -16,6 +19,8 @@ DEFAULT_SCOPES = (
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/tasks",
 )
 
 
@@ -86,8 +91,72 @@ class GmailAuthService:
         self._save_token(creds)
         return creds
 
+    def delete_token(self) -> bool:
+        if self._token_path.exists():
+            self._token_path.unlink()
+            return True
+        return False
+
+    def start_reauth_flow(self) -> tuple[str, Callable[[], Credentials]]:
+        credentials_path = (self._config.credentials_path or "").strip()
+        if not credentials_path:
+            raise ValueError("Gmail credentials path is not configured.")
+        credentials_path_value = Path(credentials_path)
+        if not credentials_path_value.is_absolute():
+            root = Path(__file__).resolve().parents[2]
+            credentials_path_value = root / credentials_path_value
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(credentials_path_value), self._scopes
+        )
+        host = "localhost"
+        port = 8080
+        wsgi_app = _RedirectWSGIApp(
+            "The authentication flow has completed. You may close this window."
+        )
+        wsgiref.simple_server.WSGIServer.allow_reuse_address = False
+        local_server = wsgiref.simple_server.make_server(
+            host, port, wsgi_app, handler_class=_WSGIRequestHandler
+        )
+        flow.redirect_uri = f"http://{host}:{local_server.server_port}/"
+        auth_url, _ = flow.authorization_url(prompt="consent")
+        if self._config.open_browser:
+            webbrowser.get().open(auth_url, new=1, autoraise=True)
+
+        def _complete() -> Credentials:
+            try:
+                local_server.handle_request()
+                if not wsgi_app.last_request_uri:
+                    raise RuntimeError("Authorization response was not received.")
+                authorization_response = wsgi_app.last_request_uri.replace(
+                    "http", "https"
+                )
+                flow.fetch_token(authorization_response=authorization_response)
+                creds = flow.credentials
+                self._save_token(creds)
+                return creds
+            finally:
+                local_server.server_close()
+
+        return auth_url, _complete
+
     def _save_token(self, creds: Credentials) -> None:
         self._token_path.parent.mkdir(parents=True, exist_ok=True)
         with self._token_path.open("w", encoding="utf-8") as handle:
             handle.write(creds.to_json())
             handle.write("\n")
+
+
+class _WSGIRequestHandler(wsgiref.simple_server.WSGIRequestHandler):
+    def log_message(self, format, *args):
+        logger.info(format, *args)
+
+
+class _RedirectWSGIApp:
+    def __init__(self, success_message: str) -> None:
+        self.last_request_uri: str | None = None
+        self._success_message = success_message
+
+    def __call__(self, environ, start_response):
+        start_response("200 OK", [("Content-type", "text/plain; charset=utf-8")])
+        self.last_request_uri = wsgiref.util.request_uri(environ)
+        return [self._success_message.encode("utf-8")]
