@@ -71,11 +71,13 @@ class GmailAuthService:
         creds = None
         if self._token_path.exists():
             try:
-                creds = Credentials.from_authorized_user_file(
-                    str(self._token_path), scopes=self._scopes
-                )
+                creds = Credentials.from_authorized_user_file(str(self._token_path))
             except Exception as exc:
                 logger.warning("Failed to load Gmail token: %s", exc)
+        if creds and not creds.scopes and self._scopes:
+            creds = Credentials.from_authorized_user_file(
+                str(self._token_path), scopes=self._scopes
+            )
         if creds and not creds.has_scopes(self._scopes):
             logger.info("Stored token missing required scopes; reauthorization required.")
             creds = None

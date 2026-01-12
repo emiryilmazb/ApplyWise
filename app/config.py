@@ -42,6 +42,8 @@ class Settings:
     gmail_oauth_open_browser: bool = True
     drive_token_path: str = ""
     drive_scopes: str = ""
+    docs_token_path: str = ""
+    docs_scopes: str = ""
     photos_token_path: str = ""
     photos_scopes: str = ""
     streaming_enabled: bool = True
@@ -122,6 +124,8 @@ def get_settings() -> Settings:
         gmail_oauth_open_browser=_env_flag("GMAIL_OAUTH_OPEN_BROWSER", True),
         drive_token_path=os.getenv("DRIVE_OAUTH_TOKEN_PATH", ""),
         drive_scopes=os.getenv("DRIVE_SCOPES", ""),
+        docs_token_path=os.getenv("DOCS_OAUTH_TOKEN_PATH", ""),
+        docs_scopes=os.getenv("DOCS_SCOPES", ""),
         photos_token_path=os.getenv("PHOTOS_OAUTH_TOKEN_PATH", ""),
         photos_scopes=os.getenv("PHOTOS_SCOPES", ""),
         streaming_enabled=_env_flag("STREAMING_ENABLED", True),

@@ -1,6 +1,8 @@
 import asyncio
 import inspect
 import io
+import os
+import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -30,6 +32,7 @@ from app.memory.long_term import ConversationMemoryManager, migrate_profile_json
 from app.session_manager import (
     clear_session,
     get_session_context,
+    record_handoff_detail,
     record_image_result,
     record_user_message,
     should_reset_context,
@@ -38,6 +41,7 @@ from app.services.gmail_service import GMAIL_LABELS, DraftSpec, build_gmail_serv
 from app.services.google_calendar_service import build_calendar_service
 from app.services.google_people_service import build_people_service
 from app.services.google_drive_service import build_drive_service
+from app.services.google_docs_service import build_docs_service
 from app.services.google_photos_service import build_photos_service
 from app.services.google_sheets_service import build_sheets_service
 from app.services.google_tasks_service import build_tasks_service
@@ -130,6 +134,9 @@ _IMAGE_COMPARE_TOKENS = (
     "prefer",
     "better",
     "best",
+    "hangi",
+    "daha iyi",
+    "daha guzel",
     "karsilastir",
     "hangisi",
     "hangisini",
@@ -156,10 +163,22 @@ _IMAGE_TRANSFER_TOKENS = (
     "yerlestir",
     "yap",
 )
+_REPLACEMENT_PIVOT_TOKENS = (
+    "replace",
+    "instead of",
+    "yerine",
+)
 _MAX_MULTI_IMAGE_COUNT = 10
 _IMAGE_DISAMBIGUATION_LIMIT = 10
 _MEDIA_GROUP_FLUSH_DELAY = 1.0
 _CHAT_CONTEXT_LIMIT = 20
+_CHAT_STYLE_GUIDE = (
+    "Response style:\n"
+    "- Reply in the user's language.\n"
+    "- Use a few relevant emojis to improve readability, but keep it subtle (1-3 per response).\n"
+    "- Avoid emojis in code blocks, commands, file paths, or when the user asks for strict formatting.\n"
+    "- Skip emojis for sensitive or serious topics, and follow explicit user instructions over these guidelines."
+)
 _SUGGESTION_PREFIX = "SUGG:"
 _TELEGRAM_TEXT_CHUNK = 3500
 _TELEGRAM_CAPTION_LIMIT = 1024
@@ -239,12 +258,41 @@ _ANON_OFF_COMMANDS = {"anonymous off", "anonim off", "anonim kapat"}
 _COMMAND_LIST_COMMANDS = {"commands", "/commands", "/help", "help", "komutlar", "/komutlar"}
 _CLEAR_HISTORY_CONFIRM_DATA = "clear_history_yes"
 _CLEAR_HISTORY_CANCEL_DATA = "clear_history_no"
+_PROFILE_KEY_PREFIXES = (
+    "identity.",
+    "preferences.",
+    "interests.",
+    "dislikes.",
+    "constraints.",
+)
 _GMAIL_SEND_CONFIRM_DATA = "gmail_send_yes"
 _GMAIL_SEND_CANCEL_DATA = "gmail_send_no"
 _APPROVAL_ID_PATTERN = re.compile(
     r"approval_id=([A-Za-z0-9-]+)", re.IGNORECASE)
 _GMAIL_APPROVE_TOKENS = {"yes", "y", "ok", "confirm", "approve", "evet", "onay", "onayla", "gonder"}
 _GMAIL_REJECT_TOKENS = {"no", "n", "cancel", "reject", "hayir", "iptal", "vazgec"}
+_GMAIL_FOLLOWUP_TOKENS = (
+    "link",
+    "baglanti",
+    "url",
+    "yukaridaki",
+    "onceki",
+    "son mail",
+    "sonuncu",
+    "tekrar",
+    "yeniden",
+    "dogru",
+    "emin",
+    "kontrol",
+    "calismiyor",
+    "calismadi",
+    "acilmiyor",
+    "gecersiz",
+)
+_GMAIL_SEARCH_ACTION_TOKENS = ("ara", "search", "bul", "listele", "tara", "find")
+_GMAIL_QUERY_OPERATOR_PATTERN = re.compile(
+    r"\b(from|to|subject|label|has|is|after|before):", re.IGNORECASE
+)
 
 _ANALYSIS_CLASSIFIER_PROMPT = """
 You classify the user's request about an image.
@@ -295,9 +343,18 @@ class PendingImageRequest:
     created_at: float
 
 
+@dataclass
+class PendingImagePrompt:
+    image_paths: list[str]
+    created_at: float
+
+
 _PENDING_IMAGE_REQUESTS: dict[str, "PendingImageRequest"] = {}
 _PENDING_IMAGE_REQUESTS_LOCK = asyncio.Lock()
 _PENDING_IMAGE_TTL_SECONDS = 10 * 60
+_AWAITING_IMAGE_PROMPT: dict[str, "PendingImagePrompt"] = {}
+_AWAITING_IMAGE_PROMPT_LOCK = asyncio.Lock()
+_AWAITING_IMAGE_PROMPT_TTL_SECONDS = 5 * 60
 
 
 def _resolve_user_id(update: Update) -> str | None:
@@ -528,6 +585,19 @@ def _resolve_settings(context: ContextTypes.DEFAULT_TYPE):
     return settings or get_settings()
 
 
+def _build_restart_argv() -> list[str]:
+    import __main__
+
+    spec = getattr(__main__, "__spec__", None)
+    spec_name = getattr(spec, "name", None) if spec else None
+    if spec_name:
+        return [sys.executable, "-m", spec_name, *sys.argv[1:]]
+    main_file = getattr(__main__, "__file__", None)
+    if main_file:
+        return [sys.executable, main_file, *sys.argv[1:]]
+    return [sys.executable, *sys.argv]
+
+
 def _get_memory_manager(telegram_app, settings):
     manager = telegram_app.bot_data.get("memory_manager")
     if manager is None:
@@ -583,6 +653,16 @@ def _get_drive_service(context: ContextTypes.DEFAULT_TYPE):
     settings = _resolve_settings(context)
     service = build_drive_service(settings)
     context.application.bot_data["drive_service"] = service
+    return service
+
+
+def _get_docs_service(context: ContextTypes.DEFAULT_TYPE):
+    service = context.application.bot_data.get("docs_service")
+    if service is not None:
+        return service
+    settings = _resolve_settings(context)
+    service = build_docs_service(settings)
+    context.application.bot_data["docs_service"] = service
     return service
 
 
@@ -834,6 +914,390 @@ def _apply_signature(spec: DraftSpec, signature_name: str | None) -> DraftSpec:
     return DraftSpec(to=spec.to, subject=spec.subject, body=updated_body)
 
 
+def _parse_gmail_message_ids(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed if item]
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _get_last_gmail_context(session_context: dict | None) -> tuple[str | None, list[str]]:
+    if not isinstance(session_context, dict):
+        return None, []
+    pending = session_context.get("pending_details")
+    if not isinstance(pending, dict):
+        return None, []
+    last_query = pending.get("last_gmail_query")
+    last_ids = _parse_gmail_message_ids(pending.get("last_gmail_message_ids"))
+    return (str(last_query).strip() if last_query else None), last_ids
+
+
+def _should_use_last_gmail_context(message_text: str, session_context: dict | None) -> bool:
+    _, last_ids = _get_last_gmail_context(session_context)
+    if not last_ids:
+        return False
+    normalized = _normalize_text(message_text or "")
+    if _GMAIL_QUERY_OPERATOR_PATTERN.search(message_text or ""):
+        return False
+    if _contains_any(normalized, _GMAIL_SEARCH_ACTION_TOKENS):
+        return False
+    return _contains_any(normalized, _GMAIL_FOLLOWUP_TOKENS)
+
+
+def _store_gmail_context(user_id: str | None, query: str | None, messages: list[object]) -> None:
+    if not user_id or not messages:
+        return
+    message_ids = [getattr(item, "message_id", "") for item in messages]
+    message_ids = [item for item in message_ids if item]
+    if query:
+        record_handoff_detail(user_id, "last_gmail_query", query)
+    if message_ids:
+        record_handoff_detail(
+            user_id, "last_gmail_message_ids", json.dumps(message_ids)
+        )
+
+
+async def _load_gmail_messages_by_ids(gmail_service, message_ids: list[str]) -> list:
+    cleaned = [str(item) for item in (message_ids or []) if item]
+    if not cleaned:
+        return []
+
+    def _runner():
+        return [gmail_service.get_message(message_id) for message_id in cleaned]
+
+    return await asyncio.to_thread(_runner)
+
+
+def _extract_workspace_id(value: object, key: str) -> str:
+    if isinstance(value, dict):
+        raw = value.get(key)
+        cleaned = str(raw or "").strip()
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _extract_workspace_ids(items: object, key: str) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    cleaned: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get(key) or "").strip()
+        if value:
+            cleaned.append(value)
+    return cleaned
+
+
+def _store_workspace_context(user_id: str | None, actions: list[object]) -> None:
+    if not user_id or not actions:
+        return
+    for action in actions:
+        if not getattr(action, "ok", False):
+            continue
+        name = str(getattr(action, "name", "") or "")
+        result = getattr(action, "result", None)
+        args = getattr(action, "args", None)
+        payload = result if isinstance(result, dict) else {}
+        arg_map = args if isinstance(args, dict) else {}
+
+        if name in {"drive_search_files", "drive_list_folder"}:
+            file_ids = _extract_workspace_ids(payload.get("files"), "file_id")
+            if file_ids:
+                record_handoff_detail(
+                    user_id, "last_drive_file_ids", json.dumps(file_ids)
+                )
+            if name == "drive_list_folder":
+                folder_id = str(arg_map.get("folder_id") or "").strip()
+                if folder_id:
+                    record_handoff_detail(user_id, "last_drive_folder_id", folder_id)
+            query = str(arg_map.get("query") or arg_map.get("content_query") or "").strip()
+            if query:
+                record_handoff_detail(user_id, "last_drive_query", query)
+            continue
+
+        if name in {"drive_get_metadata", "drive_get_file_text", "drive_analyze_file"}:
+            file_id = _extract_workspace_id(payload.get("file"), "file_id")
+            if not file_id:
+                file_id = str(arg_map.get("file_id") or "").strip()
+            if file_id:
+                record_handoff_detail(
+                    user_id, "last_drive_file_ids", json.dumps([file_id])
+                )
+            continue
+
+        if name == "calendar_list_events":
+            event_ids = _extract_workspace_ids(payload.get("events"), "event_id")
+            if event_ids:
+                record_handoff_detail(
+                    user_id, "last_calendar_event_ids", json.dumps(event_ids)
+                )
+            continue
+
+        if name in {"calendar_create_event", "calendar_update_event"}:
+            event_id = _extract_workspace_id(payload.get("event"), "event_id")
+            if event_id:
+                record_handoff_detail(
+                    user_id, "last_calendar_event_ids", json.dumps([event_id])
+                )
+            continue
+
+        if name == "calendar_delete_event":
+            event_id = str(payload.get("event_id") or arg_map.get("event_id") or "").strip()
+            if event_id:
+                record_handoff_detail(
+                    user_id, "last_calendar_event_ids", json.dumps([event_id])
+                )
+            continue
+
+        if name == "tasks_list_tasklists":
+            tasklist_ids = _extract_workspace_ids(payload.get("tasklists"), "tasklist_id")
+            if tasklist_ids:
+                record_handoff_detail(
+                    user_id, "last_tasklist_ids", json.dumps(tasklist_ids)
+                )
+            continue
+
+        if name == "tasks_list":
+            task_ids = _extract_workspace_ids(payload.get("tasks"), "task_id")
+            if task_ids:
+                record_handoff_detail(
+                    user_id, "last_task_ids", json.dumps(task_ids)
+                )
+            tasklist_id = str(arg_map.get("tasklist_id") or "").strip()
+            if tasklist_id:
+                record_handoff_detail(user_id, "last_tasklist_id", tasklist_id)
+            continue
+
+        if name in {"tasks_create", "tasks_update", "tasks_complete"}:
+            task_id = _extract_workspace_id(payload.get("task"), "task_id")
+            if task_id:
+                record_handoff_detail(
+                    user_id, "last_task_ids", json.dumps([task_id])
+                )
+            tasklist_id = str(arg_map.get("tasklist_id") or "").strip()
+            if tasklist_id:
+                record_handoff_detail(user_id, "last_tasklist_id", tasklist_id)
+            continue
+
+        if name == "tasks_delete":
+            task_id = str(payload.get("task_id") or arg_map.get("task_id") or "").strip()
+            if task_id:
+                record_handoff_detail(
+                    user_id, "last_task_ids", json.dumps([task_id])
+                )
+            tasklist_id = str(arg_map.get("tasklist_id") or "").strip()
+            if tasklist_id:
+                record_handoff_detail(user_id, "last_tasklist_id", tasklist_id)
+            continue
+
+        if name in {"people_search_contacts", "people_list_connections"}:
+            resource_names = _extract_workspace_ids(payload.get("contacts"), "resource_name")
+            if resource_names:
+                record_handoff_detail(
+                    user_id, "last_people_resource_names", json.dumps(resource_names)
+                )
+            query = str(arg_map.get("query") or "").strip()
+            if query:
+                record_handoff_detail(user_id, "last_people_query", query)
+            continue
+
+        if name == "people_get_contact":
+            resource_name = _extract_workspace_id(payload.get("contact"), "resource_name")
+            if resource_name:
+                record_handoff_detail(
+                    user_id, "last_people_resource_names", json.dumps([resource_name])
+                )
+            continue
+
+        if name == "photos_search_media_items":
+            media_ids = _extract_workspace_ids(payload.get("media_items"), "media_item_id")
+            if media_ids:
+                record_handoff_detail(
+                    user_id, "last_photo_media_item_ids", json.dumps(media_ids)
+                )
+            album_id = str(arg_map.get("album_id") or "").strip()
+            if album_id:
+                record_handoff_detail(
+                    user_id, "last_photo_album_ids", json.dumps([album_id])
+                )
+            continue
+
+        if name == "photos_list_albums":
+            album_ids = _extract_workspace_ids(payload.get("albums"), "album_id")
+            if album_ids:
+                record_handoff_detail(
+                    user_id, "last_photo_album_ids", json.dumps(album_ids)
+                )
+            continue
+
+        if name == "photos_create_album":
+            album_id = _extract_workspace_id(payload.get("album"), "album_id")
+            if album_id:
+                record_handoff_detail(
+                    user_id, "last_photo_album_ids", json.dumps([album_id])
+                )
+            continue
+
+        if name == "photos_add_to_album":
+            album_id = str(payload.get("album_id") or arg_map.get("album_id") or "").strip()
+            if album_id:
+                record_handoff_detail(
+                    user_id, "last_photo_album_ids", json.dumps([album_id])
+                )
+            media_ids = payload.get("media_item_ids") or arg_map.get("media_item_ids")
+            if isinstance(media_ids, list) and media_ids:
+                record_handoff_detail(
+                    user_id, "last_photo_media_item_ids", json.dumps(media_ids)
+                )
+            continue
+
+        if name == "photos_get_media_metadata":
+            media_id = _extract_workspace_id(payload.get("media_item"), "media_item_id")
+            if media_id:
+                record_handoff_detail(
+                    user_id, "last_photo_media_item_ids", json.dumps([media_id])
+                )
+            continue
+
+        if name in {"docs_get_document", "docs_get_text"}:
+            document_id = _extract_workspace_id(payload.get("document"), "document_id")
+            if document_id:
+                record_handoff_detail(
+                    user_id, "last_docs_document_ids", json.dumps([document_id])
+                )
+                record_handoff_detail(user_id, "last_docs_document_id", document_id)
+            continue
+
+        if name == "docs_create_document":
+            document_id = _extract_workspace_id(payload.get("document"), "document_id")
+            if document_id:
+                record_handoff_detail(
+                    user_id, "last_docs_document_ids", json.dumps([document_id])
+                )
+                record_handoff_detail(user_id, "last_docs_document_id", document_id)
+            continue
+
+        if name in {"docs_append_text", "docs_replace_text"}:
+            document_id = str(payload.get("document_id") or arg_map.get("document_id") or "").strip()
+            if document_id:
+                record_handoff_detail(
+                    user_id, "last_docs_document_ids", json.dumps([document_id])
+                )
+                record_handoff_detail(user_id, "last_docs_document_id", document_id)
+            continue
+
+        if name == "sheets_create_spreadsheet":
+            spreadsheet_id = _extract_workspace_id(payload.get("spreadsheet"), "spreadsheet_id")
+            if spreadsheet_id:
+                record_handoff_detail(
+                    user_id, "last_sheet_spreadsheet_ids", json.dumps([spreadsheet_id])
+                )
+                record_handoff_detail(user_id, "last_sheet_spreadsheet_id", spreadsheet_id)
+            continue
+
+        if name in {"sheets_append_row", "sheets_read_range", "sheets_update_range"}:
+            spreadsheet_id = str(payload.get("spreadsheet_id") or "").strip()
+            if not spreadsheet_id:
+                spreadsheet_id = str(arg_map.get("spreadsheet_id") or "").strip()
+            if spreadsheet_id:
+                record_handoff_detail(
+                    user_id, "last_sheet_spreadsheet_ids", json.dumps([spreadsheet_id])
+                )
+                record_handoff_detail(user_id, "last_sheet_spreadsheet_id", spreadsheet_id)
+            continue
+
+        if name == "sheets_find_spreadsheet":
+            spreadsheet_ids = _extract_workspace_ids(payload.get("spreadsheets"), "file_id")
+            if spreadsheet_ids:
+                record_handoff_detail(
+                    user_id, "last_sheet_spreadsheet_ids", json.dumps(spreadsheet_ids)
+                )
+                record_handoff_detail(user_id, "last_sheet_spreadsheet_id", spreadsheet_ids[0])
+            query = str(arg_map.get("query") or "").strip()
+            if query:
+                record_handoff_detail(user_id, "last_sheet_query", query)
+            continue
+
+        if name in {"youtube_search_videos", "youtube_list_video_details"}:
+            video_ids = _extract_workspace_ids(payload.get("videos"), "video_id")
+            if video_ids:
+                record_handoff_detail(
+                    user_id, "last_youtube_video_ids", json.dumps(video_ids)
+                )
+            query = str(arg_map.get("query") or "").strip()
+            if query:
+                record_handoff_detail(user_id, "last_youtube_query", query)
+            continue
+
+        if name == "youtube_list_playlists":
+            playlist_ids = _extract_workspace_ids(payload.get("playlists"), "playlist_id")
+            if playlist_ids:
+                record_handoff_detail(
+                    user_id, "last_youtube_playlist_ids", json.dumps(playlist_ids)
+                )
+            continue
+
+        if name == "youtube_list_playlist_items":
+            item_ids = _extract_workspace_ids(payload.get("items"), "playlist_item_id")
+            if item_ids:
+                record_handoff_detail(
+                    user_id, "last_youtube_playlist_item_ids", json.dumps(item_ids)
+                )
+            video_ids = _extract_workspace_ids(payload.get("items"), "video_id")
+            if video_ids:
+                record_handoff_detail(
+                    user_id, "last_youtube_video_ids", json.dumps(video_ids)
+                )
+            playlist_id = str(arg_map.get("playlist_id") or "").strip()
+            if playlist_id:
+                record_handoff_detail(
+                    user_id, "last_youtube_playlist_ids", json.dumps([playlist_id])
+                )
+            continue
+
+        if name in {"youtube_add_to_playlist", "youtube_add_to_watch_later"}:
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
+            playlist_item_id = str(item.get("playlist_item_id") or "").strip()
+            video_id = str(item.get("video_id") or arg_map.get("video_id") or "").strip()
+            if playlist_item_id:
+                record_handoff_detail(
+                    user_id, "last_youtube_playlist_item_ids", json.dumps([playlist_item_id])
+                )
+            if video_id:
+                record_handoff_detail(
+                    user_id, "last_youtube_video_ids", json.dumps([video_id])
+                )
+            playlist_id = str(arg_map.get("playlist_id") or "").strip()
+            if playlist_id:
+                record_handoff_detail(
+                    user_id, "last_youtube_playlist_ids", json.dumps([playlist_id])
+                )
+            continue
+
+        if name == "youtube_remove_from_playlist":
+            item_id = str(payload.get("playlist_item_id") or arg_map.get("playlist_item_id") or "").strip()
+            if item_id:
+                record_handoff_detail(
+                    user_id, "last_youtube_playlist_item_ids", json.dumps([item_id])
+                )
+            continue
+
+        if name == "youtube_fetch_transcript":
+            video_id = str(payload.get("video_id") or arg_map.get("video_id") or "").strip()
+            if video_id:
+                record_handoff_detail(
+                    user_id, "last_youtube_video_ids", json.dumps([video_id])
+                )
+            continue
+
+
 def _build_revision_prompt(subject: str, body: str, instruction: str) -> str:
     return (
         "You are revising an email draft.\n"
@@ -886,12 +1350,14 @@ async def _handle_workspace_request(
     llm_client = context.application.bot_data.get("llm_client")
     if llm_client is None:
         return False
+    user_id = _resolve_user_id_from_message(message)
     try:
         gmail_service = _get_gmail_service(context)
         calendar_service = _get_calendar_service(context)
         tasks_service = _get_tasks_service(context)
         people_service = _get_people_service(context)
         drive_service = _get_drive_service(context)
+        docs_service = _get_docs_service(context)
         photos_service = _get_photos_service(context)
         sheets_service = _get_sheets_service(context)
         youtube_service = _get_youtube_service(context)
@@ -908,6 +1374,7 @@ async def _handle_workspace_request(
             tasks_service=tasks_service,
             people_service=people_service,
             drive_service=drive_service,
+            docs_service=docs_service,
             photos_service=photos_service,
             sheets_service=sheets_service,
             youtube_service=youtube_service,
@@ -920,6 +1387,7 @@ async def _handle_workspace_request(
         return True
     if not result.handled:
         return False
+    _store_workspace_context(user_id, result.actions)
     draft_action = next(
         (
             action
@@ -995,6 +1463,8 @@ async def _handle_gmail_intelligent_request(
         logger.warning("Gmail service unavailable: %s", exc)
         await message.reply_text("Gmail service is not configured.")
         return True
+    user_id = _resolve_user_id_from_message(message)
+    session_context = get_session_context(user_id)
     prompt = (
         "You are a Gmail action planner. Decide the best action for the user request.\n"
         "Return ONLY JSON with keys:\n"
@@ -1099,16 +1569,30 @@ async def _handle_gmail_intelligent_request(
         )
         return True
 
-    gmail_query = await asyncio.to_thread(gmail_service.build_search_query, llm_client, query_text)
-    try:
-        results = await asyncio.to_thread(gmail_service.search, gmail_query, max(10, limit))
-    except Exception as exc:
-        logger.warning("Gmail search failed: %s", exc)
-        await message.reply_text("Gmail search failed.")
-        return True
+    max_results = max(10, limit)
+    last_query, last_ids = _get_last_gmail_context(session_context)
+    use_last_context = _should_use_last_gmail_context(message_text, session_context)
+    if use_last_context and last_ids:
+        results = await _load_gmail_messages_by_ids(
+            gmail_service, last_ids[:max_results]
+        )
+        gmail_query = last_query or "previous results"
+        if not results:
+            use_last_context = False
+    if not use_last_context:
+        gmail_query = await asyncio.to_thread(
+            gmail_service.build_search_query, llm_client, query_text
+        )
+        try:
+            results = await asyncio.to_thread(gmail_service.search, gmail_query, max_results)
+        except Exception as exc:
+            logger.warning("Gmail search failed: %s", exc)
+            await message.reply_text("Gmail search failed.")
+            return True
     if not results:
         await message.reply_text("No emails matched your request.")
         return True
+    _store_gmail_context(user_id, gmail_query, results)
 
     if operation == "count":
         await message.reply_text(f"Matched emails: {len(results)}")
@@ -1356,6 +1840,9 @@ def _build_command_list_text() -> str:
             "- /forget <id>: deletes the selected memory item.",
             "- /profile: shows stored profile facts.",
             "- /profile_forget <id>: deletes the selected profile fact.",
+            "- /profile_set <key> | <value>: stores a profile fact.",
+            "- /profile_forget_key <key> [| <value>]: deletes matching profile facts.",
+            "- /profile_clear: clears all stored profile facts.",
             "- /google_auth: authorizes Google access.",
             "- /google_reauth: reauthorizes Google access with updated scopes.",
             "- /inbox [n]: lists unread emails.",
@@ -1369,6 +1856,71 @@ def _build_command_list_text() -> str:
         )
     )
 
+
+def _parse_profile_set_args(text: str) -> tuple[str, str, dict[str, str]] | None:
+    payload = text.strip().split(maxsplit=1)
+    if len(payload) < 2:
+        return None
+    parts = [part.strip() for part in payload[1].split("|") if part.strip()]
+    if len(parts) < 2:
+        return None
+    key = parts[0]
+    value = parts[1]
+    options: dict[str, str] = {}
+    for part in parts[2:]:
+        if "=" not in part:
+            continue
+        opt_key, opt_value = part.split("=", 1)
+        if not opt_key.strip():
+            continue
+        options[opt_key.strip().lower()] = opt_value.strip()
+    return key, value, options
+
+
+def _parse_profile_forget_key_args(text: str) -> tuple[str, str] | None:
+    payload = text.strip().split(maxsplit=1)
+    if len(payload) < 2:
+        return None
+    parts = [part.strip() for part in payload[1].split("|") if part.strip()]
+    if not parts:
+        return None
+    key = parts[0]
+    value = parts[1] if len(parts) > 1 else ""
+    return key, value
+
+
+def _is_profile_key_allowed(key: str) -> bool:
+    cleaned = key.strip().lower()
+    if not cleaned:
+        return False
+    return any(cleaned.startswith(prefix) for prefix in _PROFILE_KEY_PREFIXES)
+
+
+def _is_profile_removal_key_allowed(key: str) -> bool:
+    cleaned = key.strip().lower()
+    if not cleaned:
+        return False
+    if _is_profile_key_allowed(cleaned):
+        return True
+    return any(cleaned == prefix.rstrip(".") for prefix in _PROFILE_KEY_PREFIXES)
+
+
+def _parse_int_option(value: str | None, default: int = 0) -> int:
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _parse_float_option(value: str | None, default: float) -> float:
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 def _resolve_clear_history_action(value: str) -> str | None:
     if value == _CLEAR_HISTORY_CONFIRM_DATA:
@@ -1703,6 +2255,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             clear_session(user_id)
         if not is_anonymous_mode(user_id):
             record_user_message(user_id, memory_text)
+    if not _is_image_request_without_caption(message.text):
+        await _clear_awaiting_image_prompt(user_id, message.chat_id)
+        await _clear_pending_image_request(user_id, message.chat_id)
 
     agent_context = context.application.bot_data.get("agent_context")
     if agent_context is None:
@@ -1788,6 +2343,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = _resolve_user_id(update)
     caption = message.caption or ""
     if caption:
+        await _clear_awaiting_image_prompt(user_id, message.chat_id)
         await _clear_pending_image_request(user_id, message.chat_id)
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id:
@@ -1884,7 +2440,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                             expected_count,
                             len(pending_request.image_paths),
                         )
-                    )
+                )
                 return
             llm_client = context.application.bot_data.get("llm_client")
             image_client = context.application.bot_data.get("image_client")
@@ -1902,6 +2458,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 reference_paths_override=[reference_path],
             )
             return
+        await _mark_awaiting_image_prompt(user_id, message.chat_id, [reference_path])
         await message.reply_text("Photo received. Tell me what you'd like to do with it.")
         return
 
@@ -1923,6 +2480,49 @@ def _media_group_key(user_id: str | None, chat_id: object, media_group_id: str) 
 
 def _pending_image_key(user_id: str | None, chat_id: object) -> str:
     return str(user_id or chat_id)
+
+
+def _awaiting_image_key(user_id: str | None, chat_id: object) -> str:
+    return str(user_id or chat_id)
+
+
+def _is_awaiting_image_prompt_stale(request: PendingImagePrompt) -> bool:
+    return (time.time() - request.created_at) > _AWAITING_IMAGE_PROMPT_TTL_SECONDS
+
+
+async def _mark_awaiting_image_prompt(
+    user_id: str | None,
+    chat_id: object,
+    image_paths: list[str],
+) -> None:
+    if not image_paths:
+        return
+    key = _awaiting_image_key(user_id, chat_id)
+    async with _AWAITING_IMAGE_PROMPT_LOCK:
+        _AWAITING_IMAGE_PROMPT[key] = PendingImagePrompt(
+            image_paths=list(image_paths),
+            created_at=time.time(),
+        )
+
+
+async def _consume_awaiting_image_prompt(
+    user_id: str | None,
+    chat_id: object,
+) -> list[str] | None:
+    key = _awaiting_image_key(user_id, chat_id)
+    async with _AWAITING_IMAGE_PROMPT_LOCK:
+        request = _AWAITING_IMAGE_PROMPT.pop(key, None)
+        if request is None:
+            return None
+        if _is_awaiting_image_prompt_stale(request):
+            return None
+        return list(request.image_paths)
+
+
+async def _clear_awaiting_image_prompt(user_id: str | None, chat_id: object) -> None:
+    key = _awaiting_image_key(user_id, chat_id)
+    async with _AWAITING_IMAGE_PROMPT_LOCK:
+        _AWAITING_IMAGE_PROMPT.pop(key, None)
 
 
 def _is_pending_image_request_stale(request: PendingImageRequest) -> bool:
@@ -2037,6 +2637,7 @@ async def _process_media_group(
     caption = (group.caption or "").strip()
     user_id = group.user_id
     if caption:
+        await _clear_awaiting_image_prompt(user_id, message.chat_id)
         await _clear_pending_image_request(user_id, message.chat_id)
         memory_text = _memory_text(caption)
         if user_id:
@@ -2131,7 +2732,7 @@ async def _process_media_group(
                             expected_count,
                             len(pending_request.image_paths),
                         )
-                    )
+                )
                 return
             llm_client = context.application.bot_data.get("llm_client")
             image_client = context.application.bot_data.get("image_client")
@@ -2149,6 +2750,7 @@ async def _process_media_group(
                 reference_paths_override=image_paths,
             )
             return
+        await _mark_awaiting_image_prompt(user_id, message.chat_id, image_paths)
         await message.reply_text("Photo received. Tell me what you'd like to do with it.")
         return
 
@@ -2393,7 +2995,11 @@ async def handle_profile_command(update: Update, context: ContextTypes.DEFAULT_T
         value = str(item.get("value") or "").strip()
         if not fact_id or not key or not value:
             continue
-        lines.append(f"- {fact_id}: {key} = {value}")
+        confidence = item.get("confidence")
+        conf_label = ""
+        if isinstance(confidence, (int, float)):
+            conf_label = f" (conf={confidence:.2f})"
+        lines.append(f"- {fact_id}: {key} = {value}{conf_label}")
     await message.reply_text("\n".join(lines))
 
 
@@ -2448,6 +3054,142 @@ async def handle_profile_forget_command(update: Update, context: ContextTypes.DE
     await message.reply_text(f"Profile item deleted: {target_id}")
 
 
+async def handle_profile_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not message.text:
+        return
+    user_id = _resolve_user_id(update)
+    if not user_id:
+        await message.reply_text("No user id available for profile updates.")
+        return
+    parsed = _parse_profile_set_args(message.text)
+    if parsed is None:
+        await message.reply_text("Usage: /profile_set <key> | <value> [| ttl=30 | importance=0.7 | confidence=1.0]")
+        return
+    key, value, options = parsed
+    if not _is_profile_key_allowed(key):
+        allowed = ", ".join(_PROFILE_KEY_PREFIXES)
+        await message.reply_text(f"Profile key must start with: {allowed}")
+        return
+    ttl_days = _parse_int_option(options.get("ttl") or options.get("ttl_days"), 0)
+    importance = _parse_float_option(options.get("importance"), 0.7)
+    confidence = _parse_float_option(options.get("confidence"), 1.0)
+    fact = {
+        "key": key,
+        "value": value,
+        "evidence": value,
+        "importance": importance,
+        "confidence": confidence,
+        "ttl_days": ttl_days,
+    }
+    settings = _resolve_settings(context)
+    manager = _get_memory_manager(context.application, settings)
+    if not manager.enabled:
+        await message.reply_text("Memory is disabled.")
+        return
+    db = get_database()
+    updated = manager.apply_profile_update(
+        db=db,
+        user_key=user_id,
+        facts=[fact],
+        message_text=value,
+        source="user",
+        allow_missing_evidence=True,
+    )
+    if updated:
+        await message.reply_text("Profile updated.")
+    else:
+        await message.reply_text("No profile changes applied.")
+
+
+async def handle_profile_forget_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not message.text:
+        return
+    user_id = _resolve_user_id(update)
+    if not user_id:
+        await message.reply_text("No user id available for profile updates.")
+        return
+    parsed = _parse_profile_forget_key_args(message.text)
+    if parsed is None:
+        await message.reply_text("Usage: /profile_forget_key <key> [| <value>]")
+        return
+    key, value = parsed
+    if not _is_profile_removal_key_allowed(key):
+        allowed = ", ".join(_PROFILE_KEY_PREFIXES)
+        await message.reply_text(f"Profile key must start with: {allowed}")
+        return
+    settings = _resolve_settings(context)
+    manager = _get_memory_manager(context.application, settings)
+    if not manager.enabled:
+        await message.reply_text("Memory is disabled.")
+        return
+    db = get_database()
+    updated = manager.apply_profile_update(
+        db=db,
+        user_key=user_id,
+        removals=[{"key": key, "value": value}],
+        message_text="",
+        source="user",
+        allow_missing_evidence=True,
+    )
+    if updated:
+        await message.reply_text("Profile items removed.")
+    else:
+        await message.reply_text("No profile changes applied.")
+
+
+async def handle_profile_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None:
+        return
+    user_id = _resolve_user_id(update)
+    if not user_id:
+        await message.reply_text("No user id available for profile updates.")
+        return
+    settings = _resolve_settings(context)
+    manager = _get_memory_manager(context.application, settings)
+    if not manager.enabled:
+        await message.reply_text("Memory is disabled.")
+        return
+    db = get_database()
+    manager.clear_profile(db=db, user_key=user_id)
+    await message.reply_text("Profile cleared.")
+
+
+async def handle_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message or update.effective_message
+    if message is None:
+        return
+    settings = _resolve_settings(context)
+    if settings.telegram_chat_id and str(message.chat_id) != str(settings.telegram_chat_id):
+        await message.reply_text("Restart not authorized for this chat.")
+        return
+    await message.reply_text("Restarting Atlas...")
+
+    async def _restart() -> None:
+        await asyncio.sleep(0.6)
+        try:
+            await context.application.updater.stop()
+        except Exception:
+            pass
+        try:
+            await context.application.stop()
+        except Exception:
+            pass
+        try:
+            await context.application.shutdown()
+        except Exception:
+            pass
+        try:
+            argv = _build_restart_argv()
+            os.execv(argv[0], argv)
+        except Exception as exc:
+            logger.error("Restart failed: %s", exc)
+
+    context.application.create_task(_restart())
+
+
 async def _handle_gmail_inbox(
     context: ContextTypes.DEFAULT_TYPE,
     message,
@@ -2457,6 +3199,7 @@ async def _handle_gmail_inbox(
     query_hint: str | None = None,
 ) -> None:
     await _maybe_send_gmail_status(context, message, "Gmail: scanning inbox...")
+    user_id = _resolve_user_id_from_message(message)
     try:
         gmail_service = _get_gmail_service(context)
     except Exception as exc:
@@ -2475,6 +3218,10 @@ async def _handle_gmail_inbox(
     if not messages:
         await message.reply_text("No unread emails found.")
         return
+    search_query = "is:unread"
+    if query_hint:
+        search_query = f"{search_query} {query_hint}"
+    _store_gmail_context(user_id, search_query, messages)
     lines = ["Unread emails:"]
     for mail in messages:
         label = "Action Required"
@@ -2501,6 +3248,7 @@ async def _handle_gmail_summary(
 ) -> None:
     await _maybe_send_gmail_status(context, message, "Gmail: preparing summary...")
     llm_client = context.application.bot_data.get("llm_client")
+    user_id = _resolve_user_id_from_message(message)
     if llm_client is None:
         await message.reply_text("LLM is not configured for summaries.")
         return
@@ -2514,6 +3262,10 @@ async def _handle_gmail_summary(
     if not messages:
         await message.reply_text("No unread emails found.")
         return
+    search_query = "is:unread"
+    if query_hint:
+        search_query = f"{search_query} {query_hint}"
+    _store_gmail_context(user_id, search_query, messages)
     summary = await asyncio.to_thread(gmail_service.summarize_messages, llm_client, messages)
     await message.reply_text(summary)
 
@@ -2526,26 +3278,37 @@ async def _handle_gmail_search(
 ) -> None:
     await _maybe_send_gmail_status(context, message, "Gmail: searching mail...")
     llm_client = context.application.bot_data.get("llm_client")
+    user_id = _resolve_user_id_from_message(message)
+    session_context = get_session_context(user_id)
     try:
         gmail_service = _get_gmail_service(context)
     except Exception as exc:
         logger.warning("Gmail service unavailable: %s", exc)
         await message.reply_text("Gmail service is not configured.")
         return
-    gmail_query = query_text
-    if llm_client is not None:
-        gmail_query = await asyncio.to_thread(
-            gmail_service.build_search_query, llm_client, query_text
-        )
-    try:
-        results = await asyncio.to_thread(gmail_service.search, gmail_query, 15)
-    except Exception as exc:
-        logger.warning("Gmail search failed: %s", exc)
-        await message.reply_text("Gmail search failed.")
-        return
+    last_query, last_ids = _get_last_gmail_context(session_context)
+    use_last_context = _should_use_last_gmail_context(query_text, session_context)
+    if use_last_context and last_ids:
+        results = await _load_gmail_messages_by_ids(gmail_service, last_ids[:15])
+        gmail_query = last_query or "previous results"
+        if not results:
+            use_last_context = False
+    if not use_last_context:
+        gmail_query = query_text
+        if llm_client is not None:
+            gmail_query = await asyncio.to_thread(
+                gmail_service.build_search_query, llm_client, query_text
+            )
+        try:
+            results = await asyncio.to_thread(gmail_service.search, gmail_query, 15)
+        except Exception as exc:
+            logger.warning("Gmail search failed: %s", exc)
+            await message.reply_text("Gmail search failed.")
+            return
     if not results:
         await message.reply_text("No emails matched your search.")
         return
+    _store_gmail_context(user_id, gmail_query, results)
     lines = [f"Search results ({gmail_query}):"]
     for mail in results:
         sender = mail.sender or "Unknown sender"
@@ -2562,6 +3325,8 @@ async def _handle_gmail_question(
 ) -> None:
     await _maybe_send_gmail_status(context, message, "Gmail: analyzing messages...")
     llm_client = context.application.bot_data.get("llm_client")
+    user_id = _resolve_user_id_from_message(message)
+    session_context = get_session_context(user_id)
     if llm_client is None:
         await message.reply_text("LLM is not configured for Gmail questions.")
         return
@@ -2571,18 +3336,27 @@ async def _handle_gmail_question(
         logger.warning("Gmail service unavailable: %s", exc)
         await message.reply_text("Gmail service is not configured.")
         return
-    gmail_query = await asyncio.to_thread(
-        gmail_service.build_search_query, llm_client, question_text
-    )
-    try:
-        results = await asyncio.to_thread(gmail_service.search, gmail_query, 25)
-    except Exception as exc:
-        logger.warning("Gmail question search failed: %s", exc)
-        await message.reply_text("Gmail search failed.")
-        return
+    last_query, last_ids = _get_last_gmail_context(session_context)
+    use_last_context = _should_use_last_gmail_context(question_text, session_context)
+    if use_last_context and last_ids:
+        results = await _load_gmail_messages_by_ids(gmail_service, last_ids[:25])
+        gmail_query = last_query or "previous results"
+        if not results:
+            use_last_context = False
+    if not use_last_context:
+        gmail_query = await asyncio.to_thread(
+            gmail_service.build_search_query, llm_client, question_text
+        )
+        try:
+            results = await asyncio.to_thread(gmail_service.search, gmail_query, 25)
+        except Exception as exc:
+            logger.warning("Gmail question search failed: %s", exc)
+            await message.reply_text("Gmail search failed.")
+            return
     if not results:
         await message.reply_text("No emails matched your request.")
         return
+    _store_gmail_context(user_id, gmail_query, results)
     items = []
     for mail in results:
         body = (mail.body or mail.snippet or "").strip()
@@ -2785,13 +3559,15 @@ async def handle_google_auth_command(update: Update, context: ContextTypes.DEFAU
         await asyncio.to_thread(gmail_service.ensure_credentials)
         drive_service = _get_drive_service(context)
         await asyncio.to_thread(drive_service.ensure_credentials)
+        docs_service = _get_docs_service(context)
+        await asyncio.to_thread(docs_service.ensure_credentials)
         photos_service = _get_photos_service(context)
         await asyncio.to_thread(photos_service.ensure_credentials)
     except Exception as exc:
         logger.warning("Google auth failed: %s", exc)
         await message.reply_text("Google authentication failed. Check logs for details.")
         return
-    await message.reply_text("Google authentication completed for Gmail, Drive, and Photos.")
+    await message.reply_text("Google authentication completed for Gmail, Drive, Docs, and Photos.")
 
 
 async def handle_reauth_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2926,6 +3702,13 @@ async def _route_and_handle_message(
     if has_pc_prefix:
         decision = RouterDecision(
             intent=RouterIntent.COMPUTER_USE, reason="forced:pc_prefix")
+    if (
+        not has_image
+        and _is_image_request_without_caption(message_text)
+        and _mentions_explicit_image_reference(message_text)
+    ):
+        decision = RouterDecision(
+            intent=RouterIntent.IMAGE_EDIT, reason="override:image_text")
     if (
         not has_image
         and session_context
@@ -3726,8 +4509,26 @@ async def _handle_image_edit(
     llm_prompt_text = _inject_reply_context(prompt_text, reply_note)
 
     has_new_upload = photo is not None or reference_paths_override is not None
+    normalized_prompt = _normalize_text(prompt_text)
+    if not has_new_upload:
+        pending_paths = await _consume_awaiting_image_prompt(user_id, message.chat_id)
+        if pending_paths:
+            reference_paths_override = pending_paths
+            has_new_upload = True
+    if not has_new_upload:
+        expected_count = _resolve_expected_image_count(normalized_prompt, default=0)
+        if expected_count >= 2 and not _has_explicit_image_reference(normalized_prompt):
+            await _set_pending_image_request(
+                user_id,
+                message.chat_id,
+                prompt_text,
+                expected_count,
+            )
+            await message.reply_text(_format_pending_image_message(expected_count, 0))
+            return
     reference_path = None
     reference_paths: list[str] | None = None
+    reference_indexes: list[int] | None = None
     if reference_paths_override:
         reference_paths = [str(path) for path in reference_paths_override if path]
     if photo is not None:
@@ -3753,7 +4554,7 @@ async def _handle_image_edit(
         session_context = get_session_context(user_id) or session_context
 
     if reference_paths_override is None:
-        reference_paths, ambiguous = _resolve_multi_image_references(
+        reference_paths, reference_indexes, ambiguous = _resolve_multi_image_references(
             prompt_text,
             session_context,
             max_images=_MAX_MULTI_IMAGE_COUNT,
@@ -3775,20 +4576,20 @@ async def _handle_image_edit(
 
     if reference_paths is None and (not reference_path or not Path(reference_path).exists()):
         expected_count = _resolve_expected_image_count(prompt_text)
-        if expected_count >= 2:
-            await _set_pending_image_request(
-                user_id,
-                message.chat_id,
-                prompt_text,
-                expected_count,
-            )
-            await message.reply_text(_format_pending_image_message(expected_count, 0))
-            return
-        await message.reply_text("Please send the image you want to edit.")
+        if expected_count <= 0:
+            expected_count = 1
+        await _set_pending_image_request(
+            user_id,
+            message.chat_id,
+            prompt_text,
+            expected_count,
+        )
+        await message.reply_text(_format_pending_image_message(expected_count, 0))
         return
 
-    normalized_prompt = _normalize_text(prompt_text)
     available = reference_paths or ([reference_path] if reference_path else [])
+    if reference_paths and reference_indexes is None:
+        reference_indexes = _map_image_paths_to_indexes(session_context, reference_paths)
     requested_count = _extract_image_count(normalized_prompt)
     expected_count = None
     if requested_count:
@@ -3914,9 +4715,14 @@ async def _handle_image_edit(
             return
         try:
             if reference_paths and len(reference_paths) > 1:
+                multi_prompt = _build_multi_image_prompt(
+                    llm_prompt_text,
+                    purpose="analysis",
+                    image_indexes=reference_indexes,
+                )
                 response_text = await asyncio.to_thread(
                     image_client.analyze_images,
-                    llm_prompt_text,
+                    multi_prompt,
                     reference_paths,
                 )
             else:
@@ -4087,10 +4893,18 @@ async def _handle_image_edit(
 
     try:
         if reference_paths and len(reference_paths) > 1:
+            base_index, source_index = _extract_replacement_image_indexes(prompt_text)
+            multi_prompt = _build_multi_image_prompt(
+                llm_prompt_text,
+                purpose="edit",
+                image_indexes=reference_indexes,
+                base_image_index=base_index,
+                source_image_index=source_index,
+            )
             image_bytes = await _retry_image_bytes(
                 lambda: asyncio.to_thread(
                     image_client.edit_images,
-                    llm_prompt_text,
+                    multi_prompt,
                     reference_paths,
                 ),
                 label="Image edit",
@@ -4632,7 +5446,7 @@ def _build_chat_prompt(
     profile_block: str = "",
     memory_block: str = "",
 ) -> str:
-    parts: list[str] = []
+    parts: list[str] = [_CHAT_STYLE_GUIDE]
     if profile_block:
         parts.append(f"User profile:\n{profile_block}")
     if memory_block:
@@ -4643,10 +5457,8 @@ def _build_chat_prompt(
         history_block = "\n".join(line for line in lines if line)
     if history_block:
         parts.append(f"Conversation so far:\n{history_block}")
-    if parts:
-        parts.append(f"User: {prompt_text}")
-        return "\n\n".join(parts)
-    return prompt_text
+    parts.append(f"User: {prompt_text}")
+    return "\n\n".join(parts)
 
 
 def _format_history_line(entry) -> str:
@@ -5431,7 +6243,7 @@ def _extract_image_reference_index(text: str) -> int | None:
     return indexes[0] if indexes else None
 
 
-def _extract_image_reference_indexes(text: str) -> list[int]:
+def _extract_image_reference_mentions(text: str) -> list[tuple[int, int]]:
     image_tokens = r"(?:image|photo|picture|foto|fotograf|resim|gorsel)\w*"
     matches: list[tuple[int, int]] = []
     match = re.search(r"\b(\d+)\s+(?:previous|back|onceki)\b", text)
@@ -5447,7 +6259,11 @@ def _extract_image_reference_indexes(text: str) -> list[int]:
     if not matches:
         return []
     matches.sort(key=lambda item: item[0])
-    return [index for _, index in matches]
+    return matches
+
+
+def _extract_image_reference_indexes(text: str) -> list[int]:
+    return [index for _, index in _extract_image_reference_mentions(text)]
 
 
 def _mentions_last_image(text: str) -> bool:
@@ -5629,11 +6445,83 @@ def _resolve_expected_image_count(text: str, default: int = 1) -> int:
 
 def _format_pending_image_message(expected_count: int, seed_count: int) -> str:
     if seed_count <= 0:
+        if expected_count == 1:
+            return "Please send 1 image."
         return f"Please send {expected_count} images."
     remaining = expected_count - seed_count
     if remaining == 1:
         return "Please send 1 more image."
     return f"Please send {remaining} more images."
+
+
+def _has_explicit_image_reference(text: str) -> bool:
+    normalized = _normalize_text(text or "")
+    if _extract_image_reference_indexes(normalized):
+        return True
+    if _mentions_last_image(normalized):
+        return True
+    if _mentions_previous_image(normalized):
+        return True
+    if _mentions_first_image(normalized):
+        return True
+    return False
+
+
+def _build_multi_image_prompt(
+    llm_prompt_text: str,
+    *,
+    purpose: str,
+    image_indexes: list[int] | None = None,
+    base_image_index: int | None = None,
+    source_image_index: int | None = None,
+) -> str:
+    lines = [
+        "Multiple input images are provided.",
+    ]
+    if image_indexes:
+        for position, index in enumerate(image_indexes, start=1):
+            lines.append(f"Image {position} corresponds to the user's image #{index}.")
+    else:
+        lines.append("Image 1 is the first image in this list, Image 2 is the second, etc.")
+    lines.append("Use the mapping above to interpret references to first/second images.")
+    if purpose == "analysis":
+        lines.append("Answer the user's question about these images.")
+        lines.append("If the user asks which is better or preferred, pick one and explain briefly.")
+    if purpose == "edit":
+        lines.extend(
+            [
+                "Use the base image mentioned by the user as the main canvas.",
+                "Keep the base image composition and background unless asked otherwise.",
+                "Only change what the user asks; keep the rest unchanged.",
+                "Do not return an unedited input image.",
+            ]
+        )
+        if base_image_index is not None and source_image_index is not None:
+            base_position = None
+            source_position = None
+            if image_indexes:
+                try:
+                    base_position = image_indexes.index(base_image_index) + 1
+                except ValueError:
+                    base_position = None
+                try:
+                    source_position = image_indexes.index(source_image_index) + 1
+                except ValueError:
+                    source_position = None
+            if base_position and source_position:
+                lines.append(
+                    f"Base image: Image {base_position} (user's image #{base_image_index})."
+                )
+                lines.append(
+                    f"Source image: Image {source_position} (user's image #{source_image_index})."
+                )
+            else:
+                lines.append(f"Base image is the user's image #{base_image_index}.")
+                lines.append(f"Source image is the user's image #{source_image_index}.")
+            lines.append("Insert the source subject into the base image; do not output the source image alone.")
+    lines.append("Request:")
+    lines.append(llm_prompt_text)
+    return "\n".join(lines)
 
 
 def _looks_like_cross_image_edit(text: str) -> bool:
@@ -5651,19 +6539,85 @@ def _looks_like_cross_image_edit(text: str) -> bool:
     return False
 
 
+def _find_replacement_pivot(text: str) -> int | None:
+    if not text:
+        return None
+    positions: list[int] = []
+    for token in _REPLACEMENT_PIVOT_TOKENS:
+        match = re.search(rf"\b{re.escape(token)}\b", text)
+        if match:
+            positions.append(match.start())
+    return min(positions) if positions else None
+
+
+def _extract_replacement_image_indexes(text: str) -> tuple[int | None, int | None]:
+    normalized = _normalize_text(text or "")
+    if not _contains_any(normalized, _IMAGE_TRANSFER_TOKENS):
+        return None, None
+    mentions = _extract_image_reference_mentions(normalized)
+    if len(mentions) < 2:
+        return None, None
+    pivot_pos = _find_replacement_pivot(normalized)
+    if pivot_pos is not None:
+        before = [item for item in mentions if item[0] < pivot_pos]
+        after = [item for item in mentions if item[0] > pivot_pos]
+        base_index = before[-1][1] if before else None
+        source_index = after[0][1] if after else None
+        if base_index is not None and source_index is None:
+            for _, index in reversed(before[:-1]):
+                if index != base_index:
+                    source_index = index
+                    break
+        if base_index is not None and source_index is not None and base_index != source_index:
+            return base_index, source_index
+    ordered: list[int] = []
+    seen = set()
+    for _, index in mentions:
+        if index not in seen:
+            seen.add(index)
+            ordered.append(index)
+    if len(ordered) >= 2:
+        return ordered[0], ordered[1]
+    return None, None
+
+
+def _map_image_paths_to_indexes(
+    session_context: dict | None,
+    image_paths: list[str],
+) -> list[int] | None:
+    if not session_context or not image_paths:
+        return None
+    images = _get_recent_images(session_context)
+    if not images:
+        return None
+    index_map = {
+        str(item.get("path")): idx
+        for idx, item in enumerate(images, start=1)
+        if item.get("path")
+    }
+    mapped: list[int] = []
+    for path in image_paths:
+        index = index_map.get(str(path))
+        if index is None:
+            return None
+        mapped.append(index)
+    return mapped
+
+
 def _resolve_multi_image_references(
     task: str,
     session_context: dict | None,
     *,
     max_images: int,
-) -> tuple[list[str] | None, bool]:
+) -> tuple[list[str] | None, list[int] | None, bool]:
     images = _get_recent_images(session_context)
     if len(images) < 2:
-        return None, False
+        return None, None, False
     normalized = _normalize_text(task)
     indexes = _extract_image_reference_indexes(normalized)
     if indexes:
         selected: list[str] = []
+        selected_indexes: list[int] = []
         seen = set()
         for index in indexes:
             item = _select_image_by_position(images, index)
@@ -5674,29 +6628,38 @@ def _resolve_multi_image_references(
                 continue
             seen.add(path)
             selected.append(str(path))
+            selected_indexes.append(index)
         if len(selected) >= 2:
-            return selected[:max_images], False
+            return selected[:max_images], selected_indexes[:max_images], False
         if len(selected) == 1:
-            return None, False
-        return None, True
+            return None, None, False
+        return None, None, True
     count = _extract_image_count(normalized)
     if count and count >= 2:
         if len(images) < count:
-            return None, True
+            return None, None, True
         count = min(count, max_images)
         recent = images[-count:]
-        selected = [str(item.get("path")) for item in recent if item.get("path")]
+        selected: list[str] = []
+        selected_indexes: list[int] = []
+        start_index = len(images) - len(recent) + 1
+        for offset, item in enumerate(recent, start=start_index):
+            path = item.get("path")
+            if not path:
+                continue
+            selected.append(str(path))
+            selected_indexes.append(offset)
         if len(selected) >= 2:
-            return selected, False
-        return None, True
+            return selected, selected_indexes, False
+        return None, None, True
     if _contains_any(normalized, _IMAGE_COMPARE_TOKENS) and len(images) >= 2:
         recent = images[-2:]
         first = recent[0].get("path")
         second = recent[1].get("path")
         if first and second:
-            return [str(first), str(second)], False
-        return None, True
-    return None, False
+            return [str(first), str(second)], [len(images) - 1, len(images)], False
+        return None, None, True
+    return None, None, False
 
 
 async def _validate_images_for_gemini(

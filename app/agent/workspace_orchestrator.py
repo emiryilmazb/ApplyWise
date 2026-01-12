@@ -12,6 +12,7 @@ from app.services.google_calendar_service import CalendarEvent, CalendarService
 from app.services.google_tasks_service import TaskItem, TaskList, TasksService
 from app.services.google_people_service import ContactRecord, PeopleService
 from app.services.google_drive_service import DriveFileRecord, DriveService
+from app.services.google_docs_service import DocInfo, DocsService
 from app.services.google_photos_service import PhotoAlbum, PhotoMediaItem, PhotosService
 from app.services.google_sheets_service import SheetInfo, SheetsService
 from app.services.google_youtube_service import (
@@ -27,10 +28,46 @@ _MAX_TOOL_STEPS = 6
 _MAX_TOOL_CALLS = 10
 _MAX_GMAIL_BODY_CHARS = 1200
 _MAX_DRAFT_BODY_CHARS = 1200
+_FOLLOWUP_MAX_IDS = 5
+_WORKSPACE_FOLLOWUP_TOKENS = (
+    "link",
+    "baglanti",
+    "yukaridaki",
+    "onceki",
+    "son sheet",
+    "son spreadsheet",
+    "son tablo",
+    "son dokuman",
+    "son document",
+    "son doc",
+    "son docs",
+    "dokuman",
+    "belge",
+    "docs",
+    "son video",
+    "son playlist",
+    "son dosya",
+    "son etkinlik",
+    "son gorev",
+    "son kisi",
+    "son album",
+    "son foto",
+    "sonuncu",
+    "tekrar",
+    "yeniden",
+    "dogru",
+    "emin",
+    "kontrol",
+    "calismiyor",
+    "calismadi",
+    "acilmiyor",
+    "gecersiz",
+)
+_WORKSPACE_SEARCH_ACTION_TOKENS = ("ara", "search", "bul", "listele", "tara", "find")
 
 _SYSTEM_PROMPT = """You are Atlas, a corporate executive assistant.
-Use the provided tools to manage Google Sheets, YouTube, Drive, Gmail, Google Calendar, Google Tasks, Google Contacts (People API), and Google Photos.
-Always use function calls for any calendar, task, Drive, Sheets, YouTube, or Photos data retrieval or updates.
+Use the provided tools to manage Google Docs, Google Sheets, YouTube, Drive, Gmail, Google Calendar, Google Tasks, Google Contacts (People API), and Google Photos.
+Always use function calls for any calendar, task, Drive, Docs, Sheets, YouTube, or Photos data retrieval or updates.
 When sending email, create a draft first and only send after explicit user confirmation.
 If a request needs contact details, use People tools to locate names, emails, phone numbers, or birthdays.
 Minimize tool calls, respect free-tier limits, and only request data you need.
@@ -65,6 +102,7 @@ def orchestrate_workspace_request(
     tasks_service: TasksService,
     people_service: PeopleService,
     drive_service: DriveService,
+    docs_service: DocsService,
     photos_service: PhotosService,
     sheets_service: SheetsService,
     youtube_service: YouTubeService,
@@ -76,7 +114,10 @@ def orchestrate_workspace_request(
     tools = _build_tools()
     if not tools:
         return WorkspaceResult(handled=False, response_text="", actions=[])
-    contents = [_build_user_content(message_text, session_context)]
+    pending_details = _get_pending_details(session_context)
+    followup_enabled = _should_use_last_workspace_context(message_text, pending_details)
+    followup_hint = _build_followup_hint(pending_details) if followup_enabled else None
+    contents = [_build_user_content(message_text, session_context, followup_hint=followup_hint)]
     actions: list[WorkspaceAction] = []
     tool_executor = _WorkspaceToolExecutor(
         llm_client=llm_client,
@@ -85,9 +126,12 @@ def orchestrate_workspace_request(
         tasks_service=tasks_service,
         people_service=people_service,
         drive_service=drive_service,
+        docs_service=docs_service,
         photos_service=photos_service,
         sheets_service=sheets_service,
         youtube_service=youtube_service,
+        pending_details=pending_details,
+        followup_enabled=followup_enabled,
     )
     for _step in range(_MAX_TOOL_STEPS):
         response = llm_client.generate_content(
@@ -136,9 +180,12 @@ class _WorkspaceToolExecutor:
         tasks_service: TasksService,
         people_service: PeopleService,
         drive_service: DriveService,
+        docs_service: DocsService,
         photos_service: PhotosService,
         sheets_service: SheetsService,
         youtube_service: YouTubeService,
+        pending_details: dict[str, Any] | None = None,
+        followup_enabled: bool = False,
     ) -> None:
         self._llm_client = llm_client
         self._gmail_service = gmail_service
@@ -146,9 +193,54 @@ class _WorkspaceToolExecutor:
         self._tasks_service = tasks_service
         self._people_service = people_service
         self._drive_service = drive_service
+        self._docs_service = docs_service
         self._photos_service = photos_service
         self._sheets_service = sheets_service
         self._youtube_service = youtube_service
+        self._followup_enabled = followup_enabled
+        pending = pending_details or {}
+        self._last_drive_file_ids = _parse_id_list(pending.get("last_drive_file_ids"))
+        self._last_drive_folder_id = _clean_text(pending.get("last_drive_folder_id"))
+        self._last_calendar_event_ids = _parse_id_list(
+            pending.get("last_calendar_event_ids")
+        )
+        self._last_task_ids = _parse_id_list(pending.get("last_task_ids"))
+        self._last_tasklist_ids = _parse_id_list(pending.get("last_tasklist_ids"))
+        self._last_tasklist_id = _clean_text(pending.get("last_tasklist_id"))
+        if not self._last_tasklist_id and self._last_tasklist_ids:
+            self._last_tasklist_id = self._last_tasklist_ids[0]
+        self._last_people_resource_names = _parse_id_list(
+            pending.get("last_people_resource_names")
+        )
+        self._last_photo_album_ids = _parse_id_list(pending.get("last_photo_album_ids"))
+        self._last_photo_media_item_ids = _parse_id_list(
+            pending.get("last_photo_media_item_ids")
+        )
+        self._last_docs_document_ids = _parse_id_list(
+            pending.get("last_docs_document_ids")
+        )
+        self._last_docs_document_id = _clean_text(
+            pending.get("last_docs_document_id")
+        )
+        if not self._last_docs_document_id and self._last_docs_document_ids:
+            self._last_docs_document_id = self._last_docs_document_ids[0]
+        self._last_sheet_spreadsheet_ids = _parse_id_list(
+            pending.get("last_sheet_spreadsheet_ids")
+        )
+        self._last_sheet_spreadsheet_id = _clean_text(
+            pending.get("last_sheet_spreadsheet_id")
+        )
+        if not self._last_sheet_spreadsheet_id and self._last_sheet_spreadsheet_ids:
+            self._last_sheet_spreadsheet_id = self._last_sheet_spreadsheet_ids[0]
+        self._last_youtube_video_ids = _parse_id_list(
+            pending.get("last_youtube_video_ids")
+        )
+        self._last_youtube_playlist_ids = _parse_id_list(
+            pending.get("last_youtube_playlist_ids")
+        )
+        self._last_youtube_playlist_item_ids = _parse_id_list(
+            pending.get("last_youtube_playlist_item_ids")
+        )
         self._tools = {
             "gmail_search_messages": self._gmail_search_messages,
             "gmail_get_thread_messages": self._gmail_get_thread_messages,
@@ -172,6 +264,11 @@ class _WorkspaceToolExecutor:
             "drive_get_metadata": self._drive_get_metadata,
             "drive_get_file_text": self._drive_get_file_text,
             "drive_analyze_file": self._drive_analyze_file,
+            "docs_get_document": self._docs_get_document,
+            "docs_get_text": self._docs_get_text,
+            "docs_create_document": self._docs_create_document,
+            "docs_append_text": self._docs_append_text,
+            "docs_replace_text": self._docs_replace_text,
             "photos_search_media_items": self._photos_search_media_items,
             "photos_list_albums": self._photos_list_albums,
             "photos_create_album": self._photos_create_album,
@@ -220,6 +317,35 @@ class _WorkspaceToolExecutor:
                 result=None,
                 error=str(exc),
             )
+
+    def _resolve_last_id(self, candidates: list[str]) -> str:
+        if not self._followup_enabled:
+            return ""
+        return candidates[0] if candidates else ""
+
+    def _resolve_last_tasklist_id(self) -> str | None:
+        if not self._followup_enabled:
+            return None
+        return self._last_tasklist_id
+
+    def _resolve_last_docs_id(self) -> str:
+        if not self._followup_enabled:
+            return ""
+        return self._last_docs_document_id or self._resolve_last_id(self._last_docs_document_ids)
+
+    def _resolve_last_sheet_id(self) -> str:
+        if not self._followup_enabled:
+            return ""
+        return self._last_sheet_spreadsheet_id or ""
+
+    def _resolve_last_youtube_video_id(self) -> str:
+        return self._resolve_last_id(self._last_youtube_video_ids)
+
+    def _resolve_last_youtube_playlist_id(self) -> str:
+        return self._resolve_last_id(self._last_youtube_playlist_ids)
+
+    def _resolve_last_youtube_playlist_item_id(self) -> str:
+        return self._resolve_last_id(self._last_youtube_playlist_item_ids)
 
     def _gmail_search_messages(self, args: dict[str, Any]) -> dict[str, Any]:
         query = str(args.get("query") or "").strip()
@@ -307,6 +433,8 @@ class _WorkspaceToolExecutor:
     def _calendar_update_event(self, args: dict[str, Any]) -> dict[str, Any]:
         event_id = str(args.get("event_id") or "").strip()
         if not event_id:
+            event_id = self._resolve_last_id(self._last_calendar_event_ids)
+        if not event_id:
             raise ValueError("Missing event id.")
         event = self._calendar_service.update_event(
             event_id=event_id,
@@ -326,6 +454,8 @@ class _WorkspaceToolExecutor:
     def _calendar_delete_event(self, args: dict[str, Any]) -> dict[str, Any]:
         event_id = str(args.get("event_id") or "").strip()
         if not event_id:
+            event_id = self._resolve_last_id(self._last_calendar_event_ids)
+        if not event_id:
             raise ValueError("Missing event id.")
         self._calendar_service.delete_event(
             event_id=event_id,
@@ -341,9 +471,13 @@ class _WorkspaceToolExecutor:
         return {"tasklists": [_format_tasklist(item) for item in tasklists]}
 
     def _tasks_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        tasklist_id = _clean_text(args.get("tasklist_id"))
+        tasklist_title = _clean_text(args.get("tasklist_title"))
+        if not tasklist_id and not tasklist_title:
+            tasklist_id = self._resolve_last_tasklist_id()
         tasks = self._tasks_service.list_tasks(
-            tasklist_id=_clean_text(args.get("tasklist_id")),
-            tasklist_title=_clean_text(args.get("tasklist_title")),
+            tasklist_id=tasklist_id,
+            tasklist_title=tasklist_title,
             show_completed=bool(args.get("show_completed", False)),
             due_min=_clean_text(args.get("due_min")),
             due_max=_clean_text(args.get("due_max")),
@@ -356,19 +490,29 @@ class _WorkspaceToolExecutor:
         title = str(args.get("title") or "").strip()
         if not title:
             raise ValueError("Missing task title.")
+        tasklist_id = _clean_text(args.get("tasklist_id"))
+        tasklist_title = _clean_text(args.get("tasklist_title"))
+        if not tasklist_id and not tasklist_title:
+            tasklist_id = self._resolve_last_tasklist_id()
         task = self._tasks_service.create_task(
             title=title,
             notes=_clean_text(args.get("notes")),
             due=_clean_text(args.get("due")),
-            tasklist_id=_clean_text(args.get("tasklist_id")),
-            tasklist_title=_clean_text(args.get("tasklist_title")),
+            tasklist_id=tasklist_id,
+            tasklist_title=tasklist_title,
         )
         return {"task": _format_task(task)}
 
     def _tasks_update(self, args: dict[str, Any]) -> dict[str, Any]:
         task_id = str(args.get("task_id") or "").strip()
         if not task_id:
+            task_id = self._resolve_last_id(self._last_task_ids)
+        if not task_id:
             raise ValueError("Missing task id.")
+        tasklist_id = _clean_text(args.get("tasklist_id"))
+        tasklist_title = _clean_text(args.get("tasklist_title"))
+        if not tasklist_id and not tasklist_title:
+            tasklist_id = self._resolve_last_tasklist_id()
         task = self._tasks_service.update_task(
             task_id=task_id,
             title=_clean_text(args.get("title")),
@@ -376,30 +520,42 @@ class _WorkspaceToolExecutor:
             due=_clean_text(args.get("due")),
             status=_clean_text(args.get("status")),
             completed=_clean_text(args.get("completed")),
-            tasklist_id=_clean_text(args.get("tasklist_id")),
-            tasklist_title=_clean_text(args.get("tasklist_title")),
+            tasklist_id=tasklist_id,
+            tasklist_title=tasklist_title,
         )
         return {"task": _format_task(task)}
 
     def _tasks_complete(self, args: dict[str, Any]) -> dict[str, Any]:
         task_id = str(args.get("task_id") or "").strip()
         if not task_id:
+            task_id = self._resolve_last_id(self._last_task_ids)
+        if not task_id:
             raise ValueError("Missing task id.")
+        tasklist_id = _clean_text(args.get("tasklist_id"))
+        tasklist_title = _clean_text(args.get("tasklist_title"))
+        if not tasklist_id and not tasklist_title:
+            tasklist_id = self._resolve_last_tasklist_id()
         task = self._tasks_service.complete_task(
             task_id=task_id,
-            tasklist_id=_clean_text(args.get("tasklist_id")),
-            tasklist_title=_clean_text(args.get("tasklist_title")),
+            tasklist_id=tasklist_id,
+            tasklist_title=tasklist_title,
         )
         return {"task": _format_task(task)}
 
     def _tasks_delete(self, args: dict[str, Any]) -> dict[str, Any]:
         task_id = str(args.get("task_id") or "").strip()
         if not task_id:
+            task_id = self._resolve_last_id(self._last_task_ids)
+        if not task_id:
             raise ValueError("Missing task id.")
+        tasklist_id = _clean_text(args.get("tasklist_id"))
+        tasklist_title = _clean_text(args.get("tasklist_title"))
+        if not tasklist_id and not tasklist_title:
+            tasklist_id = self._resolve_last_tasklist_id()
         self._tasks_service.delete_task(
             task_id=task_id,
-            tasklist_id=_clean_text(args.get("tasklist_id")),
-            tasklist_title=_clean_text(args.get("tasklist_title")),
+            tasklist_id=tasklist_id,
+            tasklist_title=tasklist_title,
         )
         return {"deleted": True, "task_id": task_id}
 
@@ -419,6 +575,8 @@ class _WorkspaceToolExecutor:
 
     def _people_get_contact(self, args: dict[str, Any]) -> dict[str, Any]:
         resource_name = str(args.get("resource_name") or "").strip()
+        if not resource_name:
+            resource_name = self._resolve_last_id(self._last_people_resource_names)
         if not resource_name:
             raise ValueError("Missing contact resource name.")
         fields = _coerce_str_list(args.get("fields"))
@@ -472,6 +630,8 @@ class _WorkspaceToolExecutor:
 
     def _drive_list_folder(self, args: dict[str, Any]) -> dict[str, Any]:
         folder_id = _clean_text(args.get("folder_id"))
+        if not folder_id and self._followup_enabled:
+            folder_id = self._last_drive_folder_id
         max_results = _coerce_int(
             args.get("max_results"), default=20, low=1, high=100)
         page_token = _clean_text(args.get("page_token"))
@@ -488,12 +648,16 @@ class _WorkspaceToolExecutor:
     def _drive_get_metadata(self, args: dict[str, Any]) -> dict[str, Any]:
         file_id = str(args.get("file_id") or "").strip()
         if not file_id:
+            file_id = self._resolve_last_id(self._last_drive_file_ids)
+        if not file_id:
             raise ValueError("📂 Missing file id.")
         file_record = self._drive_service.get_metadata(file_id=file_id)
         return {"file": _format_drive_file(file_record)}
 
     def _drive_get_file_text(self, args: dict[str, Any]) -> dict[str, Any]:
         file_id = str(args.get("file_id") or "").strip()
+        if not file_id:
+            file_id = self._resolve_last_id(self._last_drive_file_ids)
         if not file_id:
             raise ValueError("📂 Missing file id.")
         max_chars = _coerce_int(args.get("max_chars"),
@@ -507,6 +671,8 @@ class _WorkspaceToolExecutor:
 
     def _drive_analyze_file(self, args: dict[str, Any]) -> dict[str, Any]:
         file_id = str(args.get("file_id") or "").strip()
+        if not file_id:
+            file_id = self._resolve_last_id(self._last_drive_file_ids)
         prompt = str(args.get("prompt") or args.get("question") or "").strip()
         if not file_id:
             raise ValueError("📂 Missing file id.")
@@ -533,6 +699,67 @@ class _WorkspaceToolExecutor:
                 except Exception:
                     logger.warning("Drive temp file cleanup failed.")
 
+    def _docs_get_document(self, args: dict[str, Any]) -> dict[str, Any]:
+        document_id = str(args.get("document_id") or "").strip()
+        if not document_id:
+            document_id = self._resolve_last_docs_id()
+        if not document_id:
+            raise ValueError("Missing document id.")
+        doc = self._docs_service.get_document(document_id=document_id)
+        return {"document": _format_doc(doc)}
+
+    def _docs_get_text(self, args: dict[str, Any]) -> dict[str, Any]:
+        document_id = str(args.get("document_id") or "").strip()
+        if not document_id:
+            document_id = self._resolve_last_docs_id()
+        if not document_id:
+            raise ValueError("Missing document id.")
+        max_chars = _coerce_int(args.get("max_chars"), default=12000, low=2000, high=60000)
+        payload = self._docs_service.get_document_text(
+            document_id=document_id,
+            max_chars=max_chars,
+        )
+        doc_record = payload.get("document")
+        if isinstance(doc_record, DocInfo):
+            payload["document"] = _format_doc(doc_record)
+        return payload
+
+    def _docs_create_document(self, args: dict[str, Any]) -> dict[str, Any]:
+        title = str(args.get("title") or "").strip()
+        if not title:
+            raise ValueError("Missing document title.")
+        doc = self._docs_service.create_document(title=title)
+        return {"document": _format_doc(doc)}
+
+    def _docs_append_text(self, args: dict[str, Any]) -> dict[str, Any]:
+        document_id = str(args.get("document_id") or "").strip()
+        if not document_id:
+            document_id = self._resolve_last_docs_id()
+        text = str(args.get("text") or "")
+        if not document_id:
+            raise ValueError("Missing document id.")
+        if not text.strip():
+            raise ValueError("Missing text to append.")
+        return self._docs_service.append_text(document_id=document_id, text=text)
+
+    def _docs_replace_text(self, args: dict[str, Any]) -> dict[str, Any]:
+        document_id = str(args.get("document_id") or "").strip()
+        if not document_id:
+            document_id = self._resolve_last_docs_id()
+        find_text = str(args.get("find_text") or "").strip()
+        replace_text = str(args.get("replace_text") or "")
+        match_case = bool(args.get("match_case", False))
+        if not document_id:
+            raise ValueError("Missing document id.")
+        if not find_text:
+            raise ValueError("Missing text to replace.")
+        return self._docs_service.replace_text(
+            document_id=document_id,
+            find_text=find_text,
+            replace_text=replace_text,
+            match_case=match_case,
+        )
+
     def _photos_search_media_items(self, args: dict[str, Any]) -> dict[str, Any]:
         date_ranges = args.get("date_ranges")
         if date_ranges is not None and not isinstance(date_ranges, list):
@@ -540,6 +767,8 @@ class _WorkspaceToolExecutor:
         content_categories = _coerce_str_list(args.get("content_categories"))
         media_type = _clean_text(args.get("media_type"))
         album_id = _clean_text(args.get("album_id"))
+        if not album_id and self._followup_enabled and self._last_photo_album_ids:
+            album_id = self._last_photo_album_ids[0]
         max_results = _coerce_int(
             args.get("max_results"), default=10, low=1, high=100)
         page_token = _clean_text(args.get("page_token"))
@@ -579,9 +808,13 @@ class _WorkspaceToolExecutor:
 
     def _photos_add_to_album(self, args: dict[str, Any]) -> dict[str, Any]:
         album_id = str(args.get("album_id") or "").strip()
+        if not album_id:
+            album_id = self._resolve_last_id(self._last_photo_album_ids)
         media_item_ids = args.get("media_item_ids")
         if not isinstance(media_item_ids, list):
             media_item_ids = []
+        if not media_item_ids and self._followup_enabled and self._last_photo_media_item_ids:
+            media_item_ids = list(self._last_photo_media_item_ids)
         result = self._photos_service.add_to_album(
             album_id=album_id,
             media_item_ids=media_item_ids,
@@ -590,6 +823,8 @@ class _WorkspaceToolExecutor:
 
     def _photos_get_media_metadata(self, args: dict[str, Any]) -> dict[str, Any]:
         media_item_id = str(args.get("media_item_id") or "").strip()
+        if not media_item_id:
+            media_item_id = self._resolve_last_id(self._last_photo_media_item_ids)
         if not media_item_id:
             raise ValueError("Missing media item id.")
         item = self._photos_service.get_media_metadata(
@@ -609,6 +844,8 @@ class _WorkspaceToolExecutor:
 
     def _sheets_append_row(self, args: dict[str, Any]) -> dict[str, Any]:
         spreadsheet_id = str(args.get("spreadsheet_id") or "").strip()
+        if not spreadsheet_id:
+            spreadsheet_id = self._resolve_last_sheet_id()
         if not spreadsheet_id:
             raise ValueError("Missing spreadsheet id.")
         sheet_name = _clean_text(args.get("sheet_name"))
@@ -633,6 +870,8 @@ class _WorkspaceToolExecutor:
         spreadsheet_id = str(args.get("spreadsheet_id") or "").strip()
         range_a1 = str(args.get("range") or "").strip()
         if not spreadsheet_id:
+            spreadsheet_id = self._resolve_last_sheet_id()
+        if not spreadsheet_id:
             raise ValueError("Missing spreadsheet id.")
         if not range_a1:
             raise ValueError("Missing range.")
@@ -645,6 +884,8 @@ class _WorkspaceToolExecutor:
         spreadsheet_id = str(args.get("spreadsheet_id") or "").strip()
         range_a1 = str(args.get("range") or "").strip()
         values = args.get("values")
+        if not spreadsheet_id:
+            spreadsheet_id = self._resolve_last_sheet_id()
         if not spreadsheet_id:
             raise ValueError("Missing spreadsheet id.")
         if not range_a1:
@@ -689,6 +930,8 @@ class _WorkspaceToolExecutor:
 
     def _youtube_list_video_details(self, args: dict[str, Any]) -> dict[str, Any]:
         video_ids = _coerce_str_list(args.get("video_ids")) or []
+        if not video_ids and self._followup_enabled:
+            video_ids = list(self._last_youtube_video_ids)
         videos = self._youtube_service.list_video_details(video_ids=video_ids)
         return {"videos": [_format_youtube_video(item) for item in videos]}
 
@@ -701,6 +944,8 @@ class _WorkspaceToolExecutor:
 
     def _youtube_list_playlist_items(self, args: dict[str, Any]) -> dict[str, Any]:
         playlist_id = str(args.get("playlist_id") or "").strip()
+        if not playlist_id:
+            playlist_id = self._resolve_last_youtube_playlist_id()
         if not playlist_id:
             raise ValueError("Missing playlist id.")
         max_results = _coerce_int(
@@ -715,6 +960,10 @@ class _WorkspaceToolExecutor:
         playlist_id = str(args.get("playlist_id") or "").strip()
         video_id = str(args.get("video_id") or "").strip()
         if not playlist_id:
+            playlist_id = self._resolve_last_youtube_playlist_id()
+        if not video_id:
+            video_id = self._resolve_last_youtube_video_id()
+        if not playlist_id:
             raise ValueError("Missing playlist id.")
         if not video_id:
             raise ValueError("Missing video id.")
@@ -727,12 +976,16 @@ class _WorkspaceToolExecutor:
     def _youtube_add_to_watch_later(self, args: dict[str, Any]) -> dict[str, Any]:
         video_id = str(args.get("video_id") or "").strip()
         if not video_id:
+            video_id = self._resolve_last_youtube_video_id()
+        if not video_id:
             raise ValueError("Missing video id.")
         item = self._youtube_service.add_to_watch_later(video_id=video_id)
         return {"item": _format_youtube_playlist_item(item)}
 
     def _youtube_remove_from_playlist(self, args: dict[str, Any]) -> dict[str, Any]:
         playlist_item_id = str(args.get("playlist_item_id") or "").strip()
+        if not playlist_item_id:
+            playlist_item_id = self._resolve_last_youtube_playlist_item_id()
         if not playlist_item_id:
             raise ValueError("Missing playlist item id.")
         self._youtube_service.remove_from_playlist(
@@ -741,6 +994,8 @@ class _WorkspaceToolExecutor:
 
     def _youtube_fetch_transcript(self, args: dict[str, Any]) -> dict[str, Any]:
         video_id = str(args.get("video_id") or "").strip()
+        if not video_id:
+            video_id = self._resolve_last_youtube_video_id()
         if not video_id:
             raise ValueError("Missing video id.")
         return self._youtube_service.fetch_transcript(video_id=video_id)
@@ -1097,6 +1352,66 @@ def _function_specs() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "docs_get_document",
+            "description": "Retrieve metadata for a Google Doc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "Google Docs document id."},
+                },
+                "required": ["document_id"],
+            },
+        },
+        {
+            "name": "docs_get_text",
+            "description": "Extract plain text from a Google Doc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "Google Docs document id."},
+                    "max_chars": {"type": "integer", "description": "Max characters to return (2000-60000)."},
+                },
+                "required": ["document_id"],
+            },
+        },
+        {
+            "name": "docs_create_document",
+            "description": "Create a new Google Doc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Document title."},
+                },
+                "required": ["title"],
+            },
+        },
+        {
+            "name": "docs_append_text",
+            "description": "Append text to a Google Doc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "Google Docs document id."},
+                    "text": {"type": "string", "description": "Text to append."},
+                },
+                "required": ["document_id", "text"],
+            },
+        },
+        {
+            "name": "docs_replace_text",
+            "description": "Replace text in a Google Doc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "Google Docs document id."},
+                    "find_text": {"type": "string", "description": "Text to search for."},
+                    "replace_text": {"type": "string", "description": "Replacement text."},
+                    "match_case": {"type": "boolean", "description": "Match case when searching."},
+                },
+                "required": ["document_id", "find_text", "replace_text"],
+            },
+        },
+        {
             "name": "photos_search_media_items",
             "description": "Search Google Photos by date ranges, content categories, or media type.",
             "parameters": {
@@ -1332,7 +1647,143 @@ def _function_specs() -> list[dict[str, Any]]:
     ]
 
 
-def _build_user_content(message_text: str, session_context: dict[str, Any] | None):
+def _get_pending_details(session_context: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(session_context, dict):
+        return {}
+    pending = session_context.get("pending_details")
+    if isinstance(pending, dict):
+        return pending
+    return {}
+
+
+def _parse_id_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed if str(item).strip()]
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in text for token in tokens)
+
+
+def _normalize_text(value: str) -> str:
+    normalized = value.lower()
+    return normalized.translate(
+        {
+            ord("\u00e7"): "c",
+            ord("\u011f"): "g",
+            ord("\u0131"): "i",
+            ord("\u00f6"): "o",
+            ord("\u015f"): "s",
+            ord("\u00fc"): "u",
+        }
+    )
+
+
+def _has_followup_ids(pending_details: dict[str, Any]) -> bool:
+    for key in (
+        "last_drive_file_ids",
+        "last_drive_folder_id",
+        "last_calendar_event_ids",
+        "last_task_ids",
+        "last_tasklist_ids",
+        "last_tasklist_id",
+        "last_people_resource_names",
+        "last_photo_album_ids",
+        "last_photo_media_item_ids",
+        "last_docs_document_ids",
+        "last_docs_document_id",
+        "last_sheet_spreadsheet_ids",
+        "last_sheet_spreadsheet_id",
+        "last_youtube_video_ids",
+        "last_youtube_playlist_ids",
+        "last_youtube_playlist_item_ids",
+    ):
+        if pending_details.get(key):
+            return True
+    return False
+
+
+def _should_use_last_workspace_context(
+    message_text: str,
+    pending_details: dict[str, Any],
+) -> bool:
+    if not pending_details or not _has_followup_ids(pending_details):
+        return False
+    normalized = _normalize_text(message_text or "")
+    if _contains_any(normalized, _WORKSPACE_SEARCH_ACTION_TOKENS):
+        return False
+    return _contains_any(normalized, _WORKSPACE_FOLLOWUP_TOKENS)
+
+
+def _build_followup_hint(pending_details: dict[str, Any]) -> str | None:
+    hints: list[str] = []
+    drive_ids = _parse_id_list(pending_details.get("last_drive_file_ids"))
+    if drive_ids:
+        hints.append(f"drive_file_ids={','.join(drive_ids[:_FOLLOWUP_MAX_IDS])}")
+    folder_id = _clean_text(pending_details.get("last_drive_folder_id"))
+    if folder_id:
+        hints.append(f"drive_folder_id={folder_id}")
+    doc_ids = _parse_id_list(pending_details.get("last_docs_document_ids"))
+    doc_id = _clean_text(pending_details.get("last_docs_document_id"))
+    doc_preview = doc_id or (doc_ids[0] if doc_ids else "")
+    if doc_preview:
+        hints.append(f"document_id={doc_preview}")
+    event_ids = _parse_id_list(pending_details.get("last_calendar_event_ids"))
+    if event_ids:
+        hints.append(f"calendar_event_ids={','.join(event_ids[:_FOLLOWUP_MAX_IDS])}")
+    task_ids = _parse_id_list(pending_details.get("last_task_ids"))
+    if task_ids:
+        hints.append(f"task_ids={','.join(task_ids[:_FOLLOWUP_MAX_IDS])}")
+    tasklist_ids = _parse_id_list(pending_details.get("last_tasklist_ids"))
+    tasklist_id = _clean_text(pending_details.get("last_tasklist_id"))
+    tasklist_preview = tasklist_id or (tasklist_ids[0] if tasklist_ids else "")
+    if tasklist_preview:
+        hints.append(f"tasklist_id={tasklist_preview}")
+    people_ids = _parse_id_list(pending_details.get("last_people_resource_names"))
+    if people_ids:
+        hints.append(f"people_resource_names={','.join(people_ids[:_FOLLOWUP_MAX_IDS])}")
+    album_ids = _parse_id_list(pending_details.get("last_photo_album_ids"))
+    if album_ids:
+        hints.append(f"photo_album_ids={','.join(album_ids[:_FOLLOWUP_MAX_IDS])}")
+    media_ids = _parse_id_list(pending_details.get("last_photo_media_item_ids"))
+    if media_ids:
+        hints.append(f"photo_media_item_ids={','.join(media_ids[:_FOLLOWUP_MAX_IDS])}")
+    sheet_ids = _parse_id_list(pending_details.get("last_sheet_spreadsheet_ids"))
+    sheet_id = _clean_text(pending_details.get("last_sheet_spreadsheet_id"))
+    sheet_preview = sheet_id or (sheet_ids[0] if sheet_ids else "")
+    if sheet_preview:
+        hints.append(f"spreadsheet_id={sheet_preview}")
+    youtube_video_ids = _parse_id_list(pending_details.get("last_youtube_video_ids"))
+    if youtube_video_ids:
+        hints.append(f"youtube_video_ids={','.join(youtube_video_ids[:_FOLLOWUP_MAX_IDS])}")
+    youtube_playlist_ids = _parse_id_list(pending_details.get("last_youtube_playlist_ids"))
+    if youtube_playlist_ids:
+        hints.append(f"youtube_playlist_ids={','.join(youtube_playlist_ids[:_FOLLOWUP_MAX_IDS])}")
+    youtube_item_ids = _parse_id_list(pending_details.get("last_youtube_playlist_item_ids"))
+    if youtube_item_ids:
+        hints.append(f"youtube_playlist_item_ids={','.join(youtube_item_ids[:_FOLLOWUP_MAX_IDS])}")
+    if not hints:
+        return None
+    return "Follow-up context (reuse if relevant): " + "; ".join(hints)
+
+
+def _build_user_content(
+    message_text: str,
+    session_context: dict[str, Any] | None,
+    *,
+    followup_hint: str | None = None,
+):
     from google.genai import types
 
     now = datetime.now().astimezone().isoformat()
@@ -1344,6 +1795,8 @@ def _build_user_content(message_text: str, session_context: dict[str, Any] | Non
         f"Current time: {now}\n"
         f"Session context:\n{context_block}\n"
     )
+    if followup_hint:
+        prompt += f"\n{followup_hint}\n"
     part = _text_part(types, prompt)
     return types.Content(role="user", parts=[part])
 
@@ -1497,6 +1950,15 @@ def _format_drive_file(file: DriveFileRecord) -> dict[str, Any]:
         "web_view_link": file.web_view_link,
         "size_bytes": file.size_bytes,
         "parents": file.parents,
+    }
+
+
+def _format_doc(doc: DocInfo) -> dict[str, Any]:
+    return {
+        "document_id": doc.document_id,
+        "title": doc.title,
+        "url": doc.url,
+        "revision_id": doc.revision_id,
     }
 
 

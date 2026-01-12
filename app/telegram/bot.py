@@ -21,7 +21,11 @@ from .handlers import (
     handle_pc_command,
     handle_photo_message,
     handle_profile_command,
+    handle_profile_clear_command,
     handle_profile_forget_command,
+    handle_profile_forget_key_command,
+    handle_profile_set_command,
+    handle_restart_command,
     handle_reauth_command,
     handle_search_mail_command,
     handle_summarize_last_command,
@@ -59,6 +63,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("forget", handle_forget_command))
     application.add_handler(CommandHandler("profile", handle_profile_command))
     application.add_handler(CommandHandler("profile_forget", handle_profile_forget_command))
+    application.add_handler(CommandHandler("profile_set", handle_profile_set_command))
+    application.add_handler(CommandHandler("profile_forget_key", handle_profile_forget_key_command))
+    application.add_handler(CommandHandler("profile_clear", handle_profile_clear_command))
+    application.add_handler(CommandHandler("restart", handle_restart_command))
     application.add_handler(CommandHandler("google_auth", handle_google_auth_command))
     application.add_handler(CommandHandler("google_reauth", handle_reauth_command))
     application.add_handler(CommandHandler("inbox", handle_inbox_command))
