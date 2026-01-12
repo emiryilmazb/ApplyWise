@@ -1,0 +1,18 @@
+services:
+  atlas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      PLAYWRIGHT_HEADLESS: "true"
+      COMPUTER_USE_ENABLED: "false"
+      PC_USE_SYSTEM_BROWSER: "false"
+      GMAIL_OAUTH_FLOW: "console"
+      GMAIL_OAUTH_OPEN_BROWSER: "false"
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+      - ./credentials.json:/app/credentials.json:ro
+    shm_size: "1gb"

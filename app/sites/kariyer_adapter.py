@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import re
 from uuid import uuid4
 
 from app.agent.state import AgentContext
 from app.agent.llm_client import LLMClient
 from app.application.session import ApplicationStep, FailureReason, JobApplicationSession, StepType
-from app.pc_agent.vision import capture_screen
+from app.config import get_settings
 from app.sites.base import StepExecutionResult
 
 logger = logging.getLogger(__name__)
+
+SCREENSHOT_DIR = Path(__file__).resolve().parents[2] / "artifacts" / "screenshots"
 
 _APPLY_TEXTS = (
     "Apply",
@@ -268,13 +271,13 @@ async def _find_search_box(page):
 async def _notify_search_box_missing(page, telegram_app, chat_id: str | None) -> None:
     if telegram_app is None or chat_id is None:
         return
-    screenshot = capture_screen()
-    with open(screenshot.path, "rb") as handle:
-        await telegram_app.bot.send_photo(
-            chat_id=chat_id,
-            photo=handle,
-            caption="Search box not found on Kariyer.net. Please advise.",
-        )
+    await _send_screenshot_or_message(
+        page,
+        telegram_app,
+        chat_id,
+        caption="Search box not found on Kariyer.net. Please advise.",
+        fallback_text="Search box not found on Kariyer.net. Please advise.",
+    )
 
 
 async def _dismiss_overlays(page) -> None:
@@ -320,15 +323,14 @@ async def _handle_security_check(page, llm_client, agent_context, telegram_app, 
     if agent_context is None or telegram_app is None or chat_id is None:
         raise RuntimeError("Security check requires human input but Telegram context is missing")
 
-    screenshot = None
     if decision.get("send_screenshot"):
-        screenshot = capture_screen()
-        with open(screenshot.path, "rb") as handle:
-            await telegram_app.bot.send_photo(
-                chat_id=chat_id,
-                photo=handle,
-                caption="Security verification detected. What should I do?",
-            )
+        await _send_screenshot_or_message(
+            page,
+            telegram_app,
+            chat_id,
+            caption="Security verification detected. What should I do?",
+            fallback_text="Security verification detected. What should I do?",
+        )
     else:
         await telegram_app.bot.send_message(
             chat_id=chat_id,
@@ -462,13 +464,13 @@ async def _ask_human_next_action(
         raise RuntimeError("Telegram context is required for human decision")
 
     if send_screenshot:
-        screenshot = capture_screen()
-        with open(screenshot.path, "rb") as handle:
-            await telegram_app.bot.send_photo(
-                chat_id=chat_id,
-                photo=handle,
-                caption="Login or search next? Reply LOGIN or SEARCH.",
-            )
+        await _send_screenshot_or_message(
+            page,
+            telegram_app,
+            chat_id,
+            caption="Login or search next? Reply LOGIN or SEARCH.",
+            fallback_text="Login or search next? Reply LOGIN or SEARCH.",
+        )
     else:
         await telegram_app.bot.send_message(
             chat_id=chat_id,
@@ -504,3 +506,66 @@ async def _go_to_job_listings(page) -> None:
 
     if "is-ilanlari" not in page.url:
         await page.goto("https://www.kariyer.net/is-ilanlari", wait_until="domcontentloaded")
+
+
+def _resolve_runtime_settings(telegram_app):
+    if telegram_app is None:
+        return get_settings()
+    bot_data = getattr(telegram_app, "bot_data", None)
+    if not bot_data:
+        return get_settings()
+    return bot_data.get("settings") or get_settings()
+
+
+async def _capture_playwright_screenshot(page) -> Path | None:
+    if page is None:
+        return None
+    try:
+        SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        path = SCREENSHOT_DIR / f"page_{uuid4().hex}.png"
+        await page.screenshot(path=str(path), full_page=True)
+        return path
+    except Exception as exc:
+        logger.warning("Playwright screenshot failed: %s", exc)
+        return None
+
+
+def _capture_desktop_screenshot() -> str | None:
+    try:
+        from app.pc_agent.vision import capture_screen
+    except Exception as exc:
+        logger.warning("Desktop screenshot unavailable: %s", exc)
+        return None
+    try:
+        screenshot = capture_screen()
+        return screenshot.path
+    except Exception as exc:
+        logger.warning("Desktop screenshot failed: %s", exc)
+        return None
+
+
+async def _send_screenshot_or_message(
+    page,
+    telegram_app,
+    chat_id: str | None,
+    caption: str,
+    fallback_text: str,
+) -> None:
+    if telegram_app is None or chat_id is None:
+        return
+    settings = _resolve_runtime_settings(telegram_app)
+    if not bool(getattr(settings, "screenshot_enabled", True)):
+        await telegram_app.bot.send_message(chat_id=chat_id, text=fallback_text)
+        return
+    screenshot_path = await _capture_playwright_screenshot(page)
+    if screenshot_path is None:
+        screenshot_path = _capture_desktop_screenshot()
+    if screenshot_path is None:
+        await telegram_app.bot.send_message(chat_id=chat_id, text=fallback_text)
+        return
+    with open(screenshot_path, "rb") as handle:
+        await telegram_app.bot.send_photo(
+            chat_id=chat_id,
+            photo=handle,
+            caption=caption,
+        )

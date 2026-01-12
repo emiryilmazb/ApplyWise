@@ -5,8 +5,8 @@ google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
 playwright
-pywinauto
-pyautogui
+pywinauto; sys_platform == "win32"
+pyautogui; sys_platform == "win32"
 Pillow
 psutil
 numpy

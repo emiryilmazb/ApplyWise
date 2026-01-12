@@ -19,7 +19,6 @@ from app.application.session import (
     StepType,
 )
 from app.storage.memory import append_past_answer, append_personal_fact, load_memory_context
-from app.pc_agent.controller import run_task_with_approval
 from app.sites.base import SiteAdapter, StepExecutionResult
 
 logger = logging.getLogger(__name__)
@@ -82,7 +81,7 @@ async def run_session(
         return PipelineResult(session=session, status=session.status)
     pc_agent_enabled = pc_agent_enabled and bool(getattr(settings, "computer_use_enabled", True))
 
-    page = await _ensure_playwright_page(agent_context)
+    page = await _ensure_playwright_page(agent_context, settings)
     if not session.steps:
         session.steps = await _safe_get_steps(
             adapter,
@@ -310,6 +309,8 @@ async def _attempt_pc_recovery(
     telegram_app,
     chat_id: str | None,
 ) -> bool:
+    from app.pc_agent.controller import run_task_with_approval
+
     logger.warning("Attempting PC recovery for session=%s", session.job_metadata.company)
     result = await run_task_with_approval(
         agent_context=agent_context,
@@ -332,11 +333,12 @@ def _extract_country(question: str) -> str | None:
     return None
 
 
-async def _ensure_playwright_page(agent_context: AgentContext):
+async def _ensure_playwright_page(agent_context: AgentContext, settings):
     if "playwright_async" in agent_context.pc_state:
         return agent_context.pc_state["page_async"]
     playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(headless=False)
+    headless = bool(getattr(settings, "playwright_headless", False))
+    browser = await playwright.chromium.launch(headless=headless)
     page = await browser.new_page()
     agent_context.pc_state["playwright_async"] = playwright
     agent_context.pc_state["browser_async"] = browser

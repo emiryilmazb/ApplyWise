@@ -55,6 +55,7 @@ class Settings:
     screenshot_enabled: bool = True
     browser_use_enabled: bool = True
     computer_use_enabled: bool = True
+    playwright_headless: bool = False
     pc_use_system_browser: bool = True
     pc_browser_name: str = "Chrome"
     pc_browser_window_title: str = ".*Chrome.*"
@@ -135,6 +136,7 @@ def get_settings() -> Settings:
         screenshot_enabled=_env_flag("SCREENSHOT_ENABLED", True),
         browser_use_enabled=_env_flag("BROWSER_USE_ENABLED", True),
         computer_use_enabled=_env_flag("COMPUTER_USE_ENABLED", True),
+        playwright_headless=_env_flag("PLAYWRIGHT_HEADLESS", False),
         pc_use_system_browser=_env_flag("PC_USE_SYSTEM_BROWSER", True),
         pc_browser_name=os.getenv("PC_BROWSER_NAME", "Chrome"),
         pc_browser_window_title=os.getenv("PC_BROWSER_WINDOW_TITLE", ".*Chrome.*"),

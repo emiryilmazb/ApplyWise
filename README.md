@@ -61,6 +61,25 @@ Atlas is a local, Telegram-first AI agent that automates job applications, deskt
    copy .env.example .env
    ```
 
+## Docker (headless)
+
+Docker runs Atlas in headless mode. Desktop automation (PyAutoGUI/Pywinauto) is disabled in the
+compose file because containers cannot control the host GUI.
+
+1. Copy the environment template and fill in secrets.
+   ```bash
+   copy .env.example .env
+   ```
+2. Build and start the container.
+   ```bash
+   docker compose up --build
+   ```
+
+Notes:
+- `docker-compose.yml` mounts `data/`, `artifacts/`, and `credentials.json` so tokens and images persist.
+- Google OAuth in headless mode uses `GMAIL_OAUTH_FLOW=console` and `GMAIL_OAUTH_OPEN_BROWSER=False`.
+- To use full PC automation, run the app directly on Windows instead of in Docker.
+
 ## Telegram bot setup (required)
 
 1. Open Telegram and chat with `@BotFather`.
@@ -138,6 +157,7 @@ SHOW_THOUGHTS=True
 SCREENSHOT_ENABLED=True
 BROWSER_USE_ENABLED=True
 COMPUTER_USE_ENABLED=True
+PLAYWRIGHT_HEADLESS=False
 ```
 
 PC browser control (optional):

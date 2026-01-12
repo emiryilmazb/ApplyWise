@@ -1,0 +1,14 @@
+.git
+.gitignore
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.example
+data
+artifacts
+tests
+credentials.json
+*.db
