@@ -1828,11 +1828,16 @@ def _build_function_response_part(tool_name: str, action: WorkspaceAction):
 
 
 def _extract_function_calls(response) -> list[_FunctionCall]:
-    calls = []
+    calls: list[_FunctionCall] = []
+    seen: set[str] = set()
     raw_calls = getattr(response, "function_calls", None) or []
     for call in raw_calls:
         extracted = _coerce_function_call(call)
         if extracted:
+            key = _function_call_key(extracted)
+            if key in seen:
+                continue
+            seen.add(key)
             calls.append(extracted)
     candidates = getattr(response, "candidates", None) or []
     for candidate in candidates:
@@ -1842,8 +1847,22 @@ def _extract_function_calls(response) -> list[_FunctionCall]:
             call = getattr(part, "function_call", None)
             extracted = _coerce_function_call(call)
             if extracted:
+                key = _function_call_key(extracted)
+                if key in seen:
+                    continue
+                seen.add(key)
                 calls.append(extracted)
     return calls
+
+
+def _function_call_key(call: _FunctionCall) -> str:
+    try:
+        encoded = json.dumps(
+            call.args, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+    except (TypeError, ValueError):
+        encoded = str(call.args)
+    return f"{call.name}:{encoded}"
 
 
 def _coerce_function_call(call) -> _FunctionCall | None:
