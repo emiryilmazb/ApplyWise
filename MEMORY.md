@@ -36,7 +36,7 @@ ANONYMITY_DEFAULT_OFF=True
 
 ## Privacy
 
-- Summaries are stored in SQLite (see `memory/atlas.db` by default).
+- Summaries are stored in SQLite (see `data/atlas.db` by default).
 - `anonim on` stops new writes; use `/forget <id>` to delete specific memory items.
 
 ## Disabling memory

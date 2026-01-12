@@ -43,7 +43,7 @@ def parse_scopes(
 
 def _default_token_path() -> Path:
     root = Path(__file__).resolve().parents[2]
-    return root / "memory" / "gmail_token.json"
+    return root / "data" / "gmail_token.json"
 
 
 @dataclass(frozen=True)

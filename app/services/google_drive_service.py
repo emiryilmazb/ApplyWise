@@ -391,7 +391,7 @@ def _build_temp_path(name: str | None, mime_type: str) -> Path:
 
 def _default_drive_token_path() -> Path:
     root = Path(__file__).resolve().parents[2]
-    return root / "memory" / "drive_token.json"
+    return root / "data" / "drive_token.json"
 
 
 def _suffix_for_mime(mime_type: str) -> str:

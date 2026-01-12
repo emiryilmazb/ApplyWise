@@ -342,4 +342,4 @@ def _photos_http_error(exc: HttpError) -> Exception:
 
 def _default_photos_token_path() -> Path:
     root = Path(__file__).resolve().parents[2]
-    return root / "memory" / "photos_token.json"
+    return root / "data" / "photos_token.json"

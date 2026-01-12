@@ -228,4 +228,4 @@ def _docs_http_error(exc: HttpError) -> Exception:
 
 def _default_docs_token_path() -> Path:
     root = Path(__file__).resolve().parents[2]
-    return root / "memory" / "docs_token.json"
+    return root / "data" / "docs_token.json"
