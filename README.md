@@ -1,118 +1,256 @@
-# Atlas
+# ApplyWise (Atlas)
 
-**The Next-Generation AI Agent for Autonomous Computer Use**
+ApplyWise (codename Atlas) is a local, Telegram-first AI agent that automates job applications, desktop workflows, and Google Workspace tasks using Gemini. It runs on your machine, keeps human approvals in the loop, and stores memory in SQLite so it can keep context between sessions.
 
-Atlas is a cutting-edge Python-based AI agent designed to interact with your computer just like a human does. Powered by advanced multimodal Large Language Models (LLMs) like Google Gemini, Atlas "sees" your screen, understands complex user interfaces, and autonomously navigates through desktop and web applications to execute tasks with precision.
+## What it can do
 
-While its core architecture is built for **General Computer Use**, Atlas shines brightest in its ability to automate one of the most tedious tasks in modern life: **Job Applications**.
+- Job application automation for computer use with Playwright-driven form parsing, CV-aware answers, and human review for risky or legal questions (LinkedIn adapter and Kariyer.net adapter are a stub/template today).
+- PC control workflows with action planning, approvals (YES/NO), optional high-risk confirmation (RUN), and step screenshots.
+- Google Workspace assistant capabilities for Gmail, Calendar, Tasks, Drive, Docs, Sheets, People (Contacts), Photos, and YouTube.
+- External ATS adapter that can run from a predefined list of fields when you have a custom flow.
+- Multimodal Telegram chat: image generation/editing/analysis, document summaries, and audio/video transcription.
+- Memory system with summaries and profile facts, plus an anonymous mode to stop new writes.
 
-## 🚀 The Vision: True Computer Use
+## Architecture overview
 
-Atlas isn't just a script; it's an intelligent agent that bridges the gap between AI and your operating system. By leveraging **Vision-Language Models (VLMs)**, it breaks free from fragile DOM selectors and API limitations, interacting with applications visually and logically.
+- `app/main.py`: entrypoint; bootstraps models, memory, Telegram, and job flow.
+- `app/telegram/`: Telegram bot handlers, commands, streaming, and intent routing.
+- `app/pc_agent/`: computer-use planner, executor, and vision capture.
+- `app/application/`: job application pipeline and session state machine.
+- `app/sites/`: site adapters (Kariyer, LinkedIn stub, external ATS).
+- `app/agent/`: Gemini clients, answer generation, routing, and safety.
+- `app/services/`: Gmail and Google Workspace integrations.
+- `app/storage/`: SQLite database and session persistence.
+- `data/`: default SQLite DB and OAuth tokens.
+- `artifacts/`: generated/edited images and temporary files (created at runtime).
 
-### Core Capabilities
-
-- **👀 Visual Perception:** Uses state-of-the-art vision models to analyze screen content, identifying buttons, forms, and context even when underlying code is obfuscated.
-- **🖱️ Human-Like Interaction:** Controls mouse and keyboard inputs (PyAutoGUI, Pywinauto) to click, type, scroll, and navigate seamlessly across different applications.
-- **🧠 Intelligent Planning:** Deconstructs high-level goals into actionable steps, adapting to unexpected pop-ups, security checks, or UI changes dynamically.
-- **🤖 PC Agent Mode:** Extends beyond the browser to manage desktop apps. It can control **Spotify** playback, send messages on **WhatsApp Desktop**, and more, demonstrating true OS-level agency.
-
-## 🌟 Feature Spotlight: Autonomous Job Applications
-
-Atlas leverages its powerful Computer Use foundation to revolutionize the job hunt. It acts as your tireless personal recruiter working 24/7.
-
-- **Smart Search & Match:** Automatically scans platforms like **Kariyer.net** (with architecture ready for LinkedIn) to find roles matching your specific CV profile and experience.
-- **Auto-Apply Workflow:** Navigates application forms, fills in details, uploads resumes, and handles multi-step submissions without lifting a finger.
-- **Human-in-the-Loop:** Keeps you in control via a **Telegram Bot** interface. The agent reports progress and asks for your decision on critical steps or ambiguity (e.g., specific security verifications), ensuring safety and accuracy.
-
-## 🛠️ Installation
-
-### Prerequisites
+## Requirements
 
 - Python 3.11+
-- Windows OS (Recommended for full Desktop Automation features)
-- A Google Cloud Project with Gemini API access
+- Windows (recommended for full PC automation with PyAutoGUI/Pywinauto)
+- A Gemini API key (Google AI Studio or Vertex AI)
+- Telegram account
+- Optional: Google Cloud project with OAuth credentials for Gmail/Drive/Docs/etc.
 
-### Setup
+## Installation
 
-1.  **Clone the Repository**
+1. Clone and enter the repo.
+   ```bash
+   git clone <repo-url>
+   cd ApplyWise
+   ```
 
-    ```bash
-    git clone https://github.com/yourusername/atlas.git
-    cd atlas
-    ```
+2. Create and activate a virtual environment.
+   ```bash
+   python -m venv venv
+   venv\Scripts\activate
+   ```
 
-2.  **Create a Virtual Environment**
+3. Install Python dependencies.
+   ```bash
+   pip install -r app/requirements.txt
+   ```
 
-    ```bash
-    python -m venv venv
-    venv\Scripts\activate
-    ```
+4. Install Playwright browsers.
+   ```bash
+   playwright install
+   ```
 
-3.  **Install Dependencies**
+5. Create your `.env` file from the template.
+   ```bash
+   copy .env.example .env
+   ```
 
-    ```bash
-    pip install -r app/requirements.txt
-    ```
+## Telegram bot setup (required)
 
-4.  **Install Playwright Browsers**
+1. Open Telegram and chat with `@BotFather`.
+2. Send `/newbot` and follow the prompts to pick a name and username.
+3. Copy the bot token provided by BotFather.
+4. Start a chat with your new bot and send `/start`.
+5. Get your numeric chat id:
+   - Option A: Open a chat with `@userinfobot` and copy the id it returns.
+   - Option B: After sending a message to your bot, open:
+     `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
+     and read the `chat.id` value.
+6. Set these in `.env`:
+   ```ini
+   TELEGRAM_BOT_TOKEN=your_bot_token
+   TELEGRAM_CHAT_ID=your_numeric_chat_id
+   ```
 
-    ```bash
-    playwright install
-    ```
+Notes:
+- For group chats, the chat id is negative. Add the bot to the group, send a message, and read `chat.id` from `getUpdates`.
+- The bot will refuse to start without `TELEGRAM_CHAT_ID`.
 
-5.  **Configure Environment**
-    Copy `.env.example` to `.env` and fill in your credentials:
+## Gemini API setup (required)
 
-    ```ini
-    ATLAS_APP_NAME=Atlas
+Set your API key in `.env`:
+```ini
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=gemini-3-flash-preview
+GEMINI_IMAGE_MODEL=gemini-3-pro-image-preview
+GEMINI_ENABLE_GOOGLE_SEARCH=True
+GEMINI_ENABLE_CODE_EXECUTION=True
+```
 
-    # Telegram Configuration
-    TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-    TELEGRAM_CHAT_ID=your_telegram_chat_id
+## Google OAuth setup (optional, for Gmail/Drive/Docs/etc.)
 
-    # Obtaining Telegram Credentials:
-    # 1. Start a chat with @BotFather on Telegram.
-    # 2. Send /newbot to create a new bot and get your TELEGRAM_BOT_TOKEN.
-    # 3. Start a chat with @userinfobot to get your numeric TELEGRAM_CHAT_ID.
+1. Create a Google Cloud project and enable the APIs you need:
+   - Gmail, Calendar, Tasks, People, Drive, Docs, Sheets, Photos, YouTube Data.
+2. Create OAuth credentials (Desktop app) and download the JSON.
+3. Place the JSON somewhere in the repo (for example `credentials.json`).
+4. Set the path in `.env`:
+   ```ini
+   GMAIL_OAUTH_CREDENTIALS_PATH=credentials.json
+   ```
+5. Start the bot and run `/google_auth` in Telegram to complete the OAuth flow.
+6. If you change scopes later, run `/google_reauth`.
 
-    # Google Gemini API
-    GEMINI_API_KEY=your_gemini_api_key
-    GEMINI_MODEL=gemini-3-flash-preview
-    GEMINI_IMAGE_MODEL=gemini-3-pro-image-preview
+Token files (defaults):
+- `GMAIL_OAUTH_TOKEN_PATH` (default `data/gmail_token.json`)
+- `DRIVE_OAUTH_TOKEN_PATH` (default `data/drive_token.json`)
+- `DOCS_OAUTH_TOKEN_PATH` (default `data/docs_token.json`)
+- `PHOTOS_OAUTH_TOKEN_PATH` (default `data/photos_token.json`)
 
-    # Platform Credentials (Optional)
-    KARIYERNET_USERNAME=email@example.com
-    KARIYERNET_PASSWORD=your_password
-    ```
+You can override scopes with `GMAIL_SCOPES`, `DRIVE_SCOPES`, `DOCS_SCOPES`, `PHOTOS_SCOPES`. If you override Gmail scopes, include any extra scopes you want to use (see `.env.example`).
+If you run on a headless machine, set `GMAIL_OAUTH_FLOW=console` and `GMAIL_OAUTH_OPEN_BROWSER=False`.
 
-## ▶️ Usage
+## Configuration tips
+
+Minimal required settings:
+```ini
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+GEMINI_API_KEY=
+```
+
+Job application settings:
+```ini
+KARIYER_JOB_URL=
+KARIYERNET_USERNAME=
+KARIYERNET_PASSWORD=
+```
+
+Automation toggles:
+```ini
+STREAMING_ENABLED=True
+SHOW_THOUGHTS=True
+SCREENSHOT_ENABLED=True
+BROWSER_USE_ENABLED=True
+COMPUTER_USE_ENABLED=True
+```
+
+PC browser control (optional):
+```ini
+PC_USE_SYSTEM_BROWSER=True
+PC_BROWSER_NAME=Chrome
+PC_BROWSER_WINDOW_TITLE=.*Chrome.*
+PC_BROWSER_USER_DATA_DIR=
+PC_BROWSER_EXECUTABLE_PATH=
+```
+
+Memory settings:
+```ini
+MEMORY_ENABLED=True
+MEMORY_SUMMARY_EVERY_N_USER_MSG=12
+MEMORY_RETRIEVAL_TOP_K=5
+EMBEDDING_BACKEND=sentence_transformers
+EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2
+ANONYMITY_DEFAULT_OFF=True
+SQLITE_DB_PATH=
+```
+
+Gmail polling (optional):
+```ini
+GMAIL_POLL_ENABLED=False
+GMAIL_POLL_INTERVAL_SECONDS=120
+GMAIL_POLL_MAX_RESULTS=10
+GMAIL_VIP_SENDERS=
+GMAIL_VIP_ONLY=False
+GMAIL_LATER_LABEL=Later
+GMAIL_FOCUS_MODE=False
+GMAIL_FOCUS_LABELS=Critical,Action Required
+```
+
+## Usage
 
 Start the agent:
-
 ```bash
 python -m app.main
 ```
 
-Once running, the agent will message you on Telegram: _"Atlas is online. System integrity confirmed. Gmail layers are synced, and the Gemini core is standing by. I've indexed your latest communications and prepared your digital workspace. Your Chief of Staff is ready to orchestrate.How shall we direct our focus today?"_
+On startup, the bot sends a "Job Search" button. Selecting it launches the Kariyer.net flow.
 
-You can command it to start the **"Job Search"** workflow or interact with its other PC agent capabilities directly through the chat interface.
+Examples:
+- `job_search` starts the job search workflow.
+- `job_search stop` stops the job search workflow.
+- `/pc open chrome and search for python jobs` runs a PC control task (requires approval).
 
-## Memory and Privacy
+## Job application flow notes
 
-Atlas can store long-term conversation summaries and a lightweight user profile to improve recall across days. Anonymous mode (`anonim on`) stops new message and memory writes. See `MEMORY.md` for details and configuration.
+- The Kariyer.net flow searches using a derived query from your CV profile and then fills visible form fields.
+- For better auto-answers, populate the CV profile tables in SQLite (`data/atlas.db`, tables prefixed with `cv_`).
+- If a form asks about legal/work authorization or other high-risk fields, the agent will ask you to answer in Telegram.
+- `KARIYER_JOB_URL` exists in config but is not used by the current flow.
 
-## 📂 Architecture
+## PC control approval flow
 
-- `app/pc_agent/`: The heart of the Computer Use system. Handles vision processing, screen capture, and low-level mouse/keyboard execution.
-- `app/agent/`: The brain. Manages state, intent classification, and decision-making logic using LLMs.
-- `app/sites/`: Platform-specific adapters that guide the agent on specific websites (e.g., Kariyer.net).
-- `app/telegram/`: The remote command center. Allows you to communicate with the agent from anywhere.
+1. The agent proposes an action plan and asks for approval in Telegram.
+2. Reply `YES` to proceed or `NO` to cancel. You can also reply with a revision request to refine the plan.
+3. If a step involves running executables, you will be asked to confirm with `RUN`.
 
-## ⚠️ Disclaimer
+## Images and media
 
-This tool automates interactions with third-party websites and software. Please ensure you comply with the Terms of Service (ToS) of all platforms you use. The developers are not responsible for any account restrictions or bans resulting from the use of this tool.
+- Generate images by sending a prompt (no attachment required).
+- Edit or analyze an image by replying to the image with your instructions.
+- Supported image types: PNG, JPEG, WEBP, HEIC, HEIF (Gemini limits apply).
+- Documents (PDF, TXT, DOCX, PPTX, XLSX, ODT, RTF) and common audio/video formats can be summarized in chat.
 
-## 📄 License
+## Command reference
+
+- `clear_history` or `/clear_history`: clears chat history.
+- `thinking_on` / `thinking_off`: toggles thought streaming.
+- `screenshot on` / `screenshot off`: toggles post-step screenshots.
+- `browser on` / `browser off`: toggles browser automation.
+- `pc on` / `pc off`: toggles computer control.
+- `anonymous on` / `anonymous off`: disables/enables chat logging.
+- `/memory`: lists stored memory summaries.
+- `/forget <id>`: deletes the selected memory item.
+- `/profile`: shows stored profile facts.
+- `/profile_forget <id>`: deletes the selected profile fact.
+- `/profile_set <key> | <value>`: stores a profile fact.
+- `/profile_forget_key <key> [| <value>]`: deletes matching profile facts.
+- `/profile_clear`: clears all stored profile facts.
+- `/google_auth`: authorizes Google access.
+- `/google_reauth`: reauthorizes Google access with updated scopes.
+- `/inbox [n]`: lists unread emails.
+- `/summarize_last [n]`: summarizes unread emails.
+- `/search_mail <query>`: searches Gmail.
+- `/draft_mail <to> | <subject> | <prompt>`: creates a Gmail draft.
+- `job_search`: starts job search (button).
+- `job_search stop`: stops job search.
+- `stop`: stops all actions.
+- `/pc <task>` or `pc: <task>`: starts a PC control task.
+
+## Data and storage
+
+- SQLite DB: `data/atlas.db` by default (override with `SQLITE_DB_PATH`).
+- Memory summaries and profile facts live in the SQLite database.
+- OAuth tokens live in `data/` unless overridden.
+- Generated and edited images are saved under `artifacts/`.
+
+For memory details, see `MEMORY.md`.
+
+## Tests
+
+```bash
+pytest
+```
+
+## Disclaimer
+
+This tool automates interactions with third-party websites and software. Make sure you comply with each platform's Terms of Service. The developers are not responsible for account restrictions or bans resulting from use.
+
+## License
 
 MIT License
