@@ -1,5 +1,7 @@
 services:
   atlas:
+    container_name: atlas
+    restart: unless-stopped
     build:
       context: .
       dockerfile: Dockerfile
@@ -16,3 +18,8 @@ services:
       - ./artifacts:/app/artifacts
       - ./credentials.json:/app/credentials.json:ro
     shm_size: "1gb"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
